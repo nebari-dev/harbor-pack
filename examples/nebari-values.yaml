@@ -1,11 +1,14 @@
 # Full Nebari deployment of harbor-pack.
 #
+# Harbor's admin password is NOT committed here. Both Harbor (its own admin
+# account) and the OIDC-setup Job (which authenticates to Harbor's config API)
+# read it from a single Secret named `harbor-admin` in the release namespace.
+#
 #   kubectl create namespace harbor
 #   kubectl label namespace harbor nebari.dev/managed=true --overwrite
 #   kubectl -n harbor create secret generic harbor-admin \
-#     --from-literal=password="$(openssl rand -base64 24)"
-#   helm install harbor oci://... -n harbor -f nebari-values.yaml \
-#     --set harbor.harborAdminPassword="$(kubectl -n harbor get secret harbor-admin -o jsonpath='{.data.password}' | base64 -d)"
+#     --from-literal=HARBOR_ADMIN_PASSWORD="$(openssl rand -base64 24)"
+#   helm install harbor oci://... -n harbor -f nebari-values.yaml
 #
 # Only `hostname` and `externalURL` must change for a new cluster.
 
@@ -20,14 +23,21 @@ nebariapp:
 
 oidcSetup:
   enabled: true
+  # Read the Harbor admin password from the shared external Secret instead of
+  # the upstream -core Secret (which is empty once existingSecretAdminPassword
+  # is set below).
+  adminPasswordSecret: harbor-admin
+  adminPasswordKey: HARBOR_ADMIN_PASSWORD
   # Map a Keycloak group to Harbor system-admin (optional):
   # adminGroup: harbor-admins
 
 harbor:
   externalURL: https://harbor.nebari.example.com
-  # Provide the admin password at install time via --set or an external secret;
-  # do not commit it here.
-  harborAdminPassword: ""
+  # Use the same external Secret for Harbor's own admin account. When this is
+  # set, upstream stops writing the password into its -core Secret, which is
+  # why oidcSetup points at harbor-admin above.
+  existingSecretAdminPassword: harbor-admin
+  existingSecretAdminPasswordKey: HARBOR_ADMIN_PASSWORD
 
   # --- Production storage (uncomment to use object storage + managed backends) ---
   # persistence:

@@ -1,6 +1,27 @@
-# Deploy harbor-pack via ArgoCD from the published Helm repo.
-# Update targetRevision to the released chart version and repoURL to the
-# nebari-dev Helm repository once published.
+# Deploy harbor-pack to a Nebari cluster via ArgoCD, with Keycloak SSO.
+#
+# Update `repoURL` / `targetRevision` to the published nebari-dev Helm repo and
+# released chart version once available.
+#
+# ---------------------------------------------------------------------------
+# One-time prerequisite: the Harbor admin password Secret
+# ---------------------------------------------------------------------------
+# Harbor's admin password is NOT committed here. Both Harbor (for its own admin
+# account) and the OIDC-setup Job (which authenticates to Harbor's config API)
+# read it from a single Secret named `harbor-admin` in the release namespace.
+#
+# GitOps-native: commit a SealedSecret / ExternalSecret named `harbor-admin`
+# (key HARBOR_ADMIN_PASSWORD) alongside this Application so it syncs into the
+# namespace automatically.
+#
+# Quick bootstrap (ArgoCD adopts the namespace and adds the Nebari label on the
+# first sync, so creating it here bare is fine):
+#
+#   kubectl create namespace harbor
+#   kubectl -n harbor create secret generic harbor-admin \
+#     --from-literal=HARBOR_ADMIN_PASSWORD="$(openssl rand -base64 24)"
+#
+# ---------------------------------------------------------------------------
 apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
@@ -15,10 +36,10 @@ spec:
     automated:
       prune: true
       selfHeal: true
-    syncOptions:
-      - CreateNamespace=true
-      # The namespace must carry nebari.dev/managed=true; apply it via a
-      # namespace manifest in a separate source or manage it out-of-band.
+    # No CreateNamespace=true: the chart renders the Namespace itself (below)
+    # with the nebari.dev/managed=true label the operator requires. Letting
+    # ArgoCD create an unlabeled namespace would leave the NebariApp
+    # unreconciled (NamespaceNotOptedIn).
   source:
     repoURL: https://nebari-dev.github.io/helm-repository
     chart: harbor-pack
@@ -28,10 +49,27 @@ spec:
         nebariapp:
           enabled: true
           hostname: harbor.nebari.example.com
+          # Emit the release Namespace labeled nebari.dev/managed=true so the
+          # nebari-operator reconciles the NebariApp (provisions the Keycloak
+          # OIDC client + Secret). Requires CreateNamespace=true to be OFF.
+          manageNamespace: true
           auth:
-            enabled: true
+            enabled: true            # provider=keycloak, provisionClient=true by default
+            # Restrict access to a Keycloak group (optional):
+            # groups:
+            #   - harbor-users
         oidcSetup:
           enabled: true
+          # Read the Harbor admin password from the shared external Secret
+          # (see prerequisite above) instead of the upstream -core Secret.
+          adminPasswordSecret: harbor-admin
+          adminPasswordKey: HARBOR_ADMIN_PASSWORD
+          # Map a Keycloak group to Harbor system-admin (optional):
+          # adminGroup: harbor-admins
         harbor:
           externalURL: https://harbor.nebari.example.com
-          harborAdminPassword: ""   # supply via a secret / parameter override
+          # Use the same external Secret for Harbor's own admin account. When
+          # this is set, upstream stops writing the password into its -core
+          # Secret, which is why oidcSetup points at harbor-admin above.
+          existingSecretAdminPassword: harbor-admin
+          existingSecretAdminPasswordKey: HARBOR_ADMIN_PASSWORD
