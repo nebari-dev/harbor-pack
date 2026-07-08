@@ -40,6 +40,7 @@ export default defineConfig({
             { label: 'Installation', link: '/installation/' },
             { label: 'Local Development', link: '/local-development/' },
             { label: 'Authentication', link: '/authentication/' },
+            { label: 'Registry Setup', link: '/registry-setup/' },
             { label: 'Configuration', link: '/configuration/' },
           ],
         },

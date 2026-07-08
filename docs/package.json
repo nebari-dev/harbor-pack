@@ -3,7 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "astro dev",
+    "dev": "BASE_PATH=/ astro dev",
     "build": "astro build",
     "preview": "astro preview",
     "test": "bun test test"
