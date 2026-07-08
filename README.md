@@ -61,6 +61,60 @@ kubectl -n harbor port-forward svc/harbor 8080:80
 # open http://localhost:8080  (admin / Harbor12345)
 ```
 
+## Local dev on kind
+
+`dev/` has a Makefile that stands up the full Nebari stack (Envoy Gateway, cert-manager,
+Keycloak, nebari-operator) on kind. There are two dev modes:
+
+### Simple mode (recommended for everyday work) — `make up`
+
+Exercises the real NebariApp/operator integration, but with **gateway TLS off (no cert)** and
+**OIDC off (Harbor's built-in DB admin login)** — so no cert warnings and no SSO plumbing:
+
+```sh
+cd dev
+make up              # NebariApp on, HTTP, DB auth
+make host-access     # bridges host :80/:443 to the gateway (no sudo) + prints the /etc/hosts line
+sudo sh -c 'echo "127.0.0.1 harbor.nebari.local keycloak.nebari.local" >> /etc/hosts'
+# open http://harbor.nebari.local   (login: admin / Harbor12345)
+```
+
+If you want zero Nebari machinery at all (no operator/gateway/hostnames), use
+[Standalone](#standalone-local-no-nebari) instead.
+
+### Full Keycloak SSO — `make up-sso`
+
+Deploys Harbor with the complete browser SSO flow working end-to-end:
+
+```sh
+cd dev
+make up-sso          # bootstraps the cluster + wires SSO + installs Harbor
+make host-access     # bridges host :80/:443 to the gateway (no sudo) + prints the /etc/hosts line
+```
+
+`make up-sso` creates the kind cluster with host ports 80/443 published (`kind-config.yaml`),
+so `make host-access` can bridge them to the Envoy gateway via socat in the node — no
+privileged `sudo kubectl port-forward` needed. The only `sudo` is a one-time `/etc/hosts` line
+that `make host-access` prints:
+
+```sh
+sudo sh -c 'echo "127.0.0.1 harbor.nebari.local keycloak.nebari.local" >> /etc/hosts'
+```
+
+Because Harbor uses a single OIDC endpoint for both the browser redirect and its own
+server-side token calls, `enable-sso.sh` sets `KEYCLOAK_EXTERNAL_URL` on the operator, exposes
+Keycloak at `keycloak.nebari.local` through the gateway, sets `KC_PROXY_HEADERS=xforwarded`,
+and adds a CoreDNS `hosts` entry so the issuer is identical from the browser and from Harbor
+core. It installs Harbor with `oidcSetup.verifyCert=false` (self-signed dev CA).
+
+Then open `https://harbor.nebari.local` → **LOGIN VIA OIDC PROVIDER** (Keycloak user
+`admin` / `nebari-admin`, realm `nebari`; accept the self-signed cert warnings).
+
+> **Caveat:** the operator dev stack runs Keycloak in `start-dev` (in-memory H2), so any
+> Keycloak pod restart wipes the realm. `enable-sso.sh` restarts Keycloak *before* creating
+> the realm to avoid this; if you restart Keycloak later, re-run
+> `.cache/nebari-operator/dev/scripts/services/keycloak/setup.sh`.
+
 ## Authentication
 
 Harbor performs OIDC **itself** (the portal shows a "Login via OIDC Provider" button), and

@@ -1,0 +1,15 @@
+# kind cluster config for local harbor-pack development.
+# Publishes host ports 80/443 to the control-plane node so `make host-access`
+# can bridge them to the Envoy gateway (via socat) without a privileged
+# `sudo kubectl port-forward`. Docker Desktop publishes these ports without sudo.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane
+    extraPortMappings:
+      - containerPort: 80
+        hostPort: 80
+        protocol: TCP
+      - containerPort: 443
+        hostPort: 443
+        protocol: TCP

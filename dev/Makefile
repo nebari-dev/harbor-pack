@@ -7,10 +7,16 @@
 # Prerequisites: docker, kind, helm, kubectl, git
 #
 # Usage:
-#   make up             Deploy harbor-pack on Nebari (NebariApp + OIDC enabled)
+#   make up             Deploy harbor-pack on Nebari (NebariApp + server-side OIDC)
+#   make up-sso         Deploy with the FULL browser SSO flow (see dev/enable-sso.sh)
+#   make host-access    Bridge host :80/:443 to the gateway (no sudo) + print /etc/hosts line
 #   make up-standalone  Deploy Harbor standalone (no operator/Keycloak needed)
-#   make update-hosts   Update /etc/hosts with the Harbor hostname
 #   make down           Delete the kind cluster
+#
+# Typical full-SSO run:
+#   make up-sso && make host-access
+#   sudo sh -c 'echo "127.0.0.1 harbor.nebari.local keycloak.nebari.local" >> /etc/hosts'
+#   open https://harbor.nebari.local
 
 CHART         := ../chart
 CLUSTER_NAME  := harbor-pack-dev
@@ -42,7 +48,7 @@ spec:
 endef
 export METALLB_POOL
 
-.PHONY: up up-standalone down cluster update-hosts
+.PHONY: up up-sso host-access up-standalone down cluster update-hosts
 
 # --------------------------------------------------------------------------
 # cluster - create kind cluster with full Nebari infrastructure
@@ -69,8 +75,8 @@ _clone-operator:
 	fi
 
 _kind-create:
-	@echo "Creating kind cluster: $(CLUSTER_NAME)"
-	kind create cluster --name $(CLUSTER_NAME)
+	@echo "Creating kind cluster: $(CLUSTER_NAME) (host ports 80/443 published)"
+	kind create cluster --name $(CLUSTER_NAME) --config kind-config.yaml
 
 _metallb:
 	@echo "Installing MetalLB..."
@@ -87,7 +93,12 @@ _metallb:
 
 _services:
 	@echo "Installing foundational services (Envoy Gateway, cert-manager, Keycloak, Gateway, TLS)..."
-	CLUSTER_NAME=$(CLUSTER_NAME) $(OPERATOR_REPO)/dev/scripts/services/install.sh
+	@# The stock install.sh writes /etc/hosts via sudo, which blocks unattended runs.
+	@# Generate a no-sudo variant (disable the hosts-write guard) and run that instead.
+	sed 's/.*!= "pending".*then/if false; then/' \
+		$(OPERATOR_REPO)/dev/scripts/services/install.sh \
+		> $(OPERATOR_REPO)/dev/scripts/services/install-nosudo.sh
+	CLUSTER_NAME=$(CLUSTER_NAME) bash $(OPERATOR_REPO)/dev/scripts/services/install-nosudo.sh
 
 _keycloak-setup:
 	@echo "Setting up Keycloak realm..."
@@ -103,6 +114,10 @@ _operator:
 # --------------------------------------------------------------------------
 # up - deploy harbor-pack with NebariApp + Keycloak SSO
 # --------------------------------------------------------------------------
+# up - simple dev mode: NebariApp + operator (integration is exercised), but
+#   gateway TLS OFF (no self-signed cert) and OIDC OFF (Harbor DB admin login).
+#   Access over plain HTTP at http://harbor.nebari.local after `make host-access`.
+# --------------------------------------------------------------------------
 up: cluster
 	helm dependency update $(CHART)
 	kubectl create namespace $(NAMESPACE) --dry-run=client -o yaml | kubectl apply -f -
@@ -110,16 +125,28 @@ up: cluster
 	helm upgrade --install harbor $(CHART) -n $(NAMESPACE) \
 		--set nebariapp.enabled=true \
 		--set nebariapp.hostname=$(HOSTNAME) \
-		--set harbor.externalURL=https://$(HOSTNAME) \
+		--set nebariapp.routing.tls.enabled=false \
+		--set nebariapp.auth.enabled=false \
+		--set oidcSetup.enabled=false \
+		--set harbor.externalURL=http://$(HOSTNAME) \
 		--set harbor.harborAdminPassword=$(ADMIN_PW) \
 		--wait --timeout 15m
 	kubectl wait --for=condition=Ready nebariapp/harbor-harbor-pack -n $(NAMESPACE) --timeout=180s
-	kubectl wait --for=condition=complete job/harbor-harbor-pack-oidc-setup -n $(NAMESPACE) --timeout=300s
-	CLUSTER_NAME=$(CLUSTER_NAME) $(OPERATOR_REPO)/dev/scripts/networking/update-hosts.sh
+	@# Ensure DB auth (clears oidc_auth if Harbor's DB carried it from a prior SSO run).
+	bash reset-harbor-auth.sh $(NAMESPACE) $(ADMIN_PW) || true
 	@echo ""
-	@echo "Harbor deployed with NebariApp + Keycloak SSO."
-	@echo "  https://$(HOSTNAME)   (click 'LOGIN VIA OIDC PROVIDER')"
-	@echo "  Keycloak login: admin / nebari-admin"
+	@echo "Harbor deployed with NebariApp (HTTP, DB admin auth - no cert, no SSO)."
+	@echo "  Run 'make host-access', add the /etc/hosts line, then open:"
+	@echo "  http://$(HOSTNAME)   (login: admin / $(ADMIN_PW))"
+
+# --------------------------------------------------------------------------
+# up-sso - deploy with the full host browser SSO flow
+#   Wires KEYCLOAK_EXTERNAL_URL, a Keycloak gateway route, X-Forwarded headers,
+#   and in-cluster DNS so the Keycloak issuer is identical from browser and from
+#   Harbor core. Prints the two sudo host-access commands at the end.
+# --------------------------------------------------------------------------
+up-sso: cluster
+	OPERATOR_REPO=$(OPERATOR_REPO) CLUSTER_NAME=$(CLUSTER_NAME) bash ../dev/enable-sso.sh
 
 # --------------------------------------------------------------------------
 # up-standalone - deploy Harbor without Nebari integration
@@ -134,6 +161,20 @@ up-standalone:
 	@echo ""
 	@echo "Harbor deployed standalone. Port-forward and open http://localhost:8080:"
 	@echo "  kubectl port-forward -n $(NAMESPACE) svc/harbor 8080:80"
+
+# --------------------------------------------------------------------------
+# host-access - reach the gateway from the host without a privileged port-forward
+#   Requires the cluster to have been created with kind-config.yaml (host 80/443
+#   published). Installs socat in the node forwarding :80/:443 -> Envoy gateway LB,
+#   then prints the one-time /etc/hosts line (needs sudo).
+# --------------------------------------------------------------------------
+host-access:
+	CLUSTER_NAME=$(CLUSTER_NAME) $(OPERATOR_REPO)/dev/scripts/networking/port-forward.sh
+	@echo ""
+	@echo "One-time host DNS (needs sudo):"
+	@echo "  sudo sh -c 'echo \"127.0.0.1 $(HOSTNAME) keycloak.nebari.local\" >> /etc/hosts'"
+	@echo ""
+	@echo "Then open https://$(HOSTNAME)  (accept the self-signed cert for both hosts)"
 
 update-hosts:
 	CLUSTER_NAME=$(CLUSTER_NAME) $(OPERATOR_REPO)/dev/scripts/networking/update-hosts.sh
