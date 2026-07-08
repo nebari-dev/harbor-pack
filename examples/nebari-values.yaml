@@ -1,0 +1,56 @@
+# Full Nebari deployment of harbor-pack.
+#
+#   kubectl create namespace harbor
+#   kubectl label namespace harbor nebari.dev/managed=true --overwrite
+#   kubectl -n harbor create secret generic harbor-admin \
+#     --from-literal=password="$(openssl rand -base64 24)"
+#   helm install harbor oci://... -n harbor -f nebari-values.yaml \
+#     --set harbor.harborAdminPassword="$(kubectl -n harbor get secret harbor-admin -o jsonpath='{.data.password}' | base64 -d)"
+#
+# Only `hostname` and `externalURL` must change for a new cluster.
+
+nebariapp:
+  enabled: true
+  hostname: harbor.nebari.example.com
+  auth:
+    enabled: true
+    # Restrict access to a Keycloak group (optional):
+    # groups:
+    #   - harbor-users
+
+oidcSetup:
+  enabled: true
+  # Map a Keycloak group to Harbor system-admin (optional):
+  # adminGroup: harbor-admins
+
+harbor:
+  externalURL: https://harbor.nebari.example.com
+  # Provide the admin password at install time via --set or an external secret;
+  # do not commit it here.
+  harborAdminPassword: ""
+
+  # --- Production storage (uncomment to use object storage + managed backends) ---
+  # persistence:
+  #   imageChartStorage:
+  #     type: s3
+  #     s3:
+  #       region: us-east-1
+  #       bucket: harbor-registry
+  #       regionendpoint: https://s3.us-east-1.amazonaws.com
+  #       accesskey: <access-key>
+  #       secretkey: <secret-key>
+  #       secure: true
+  # database:
+  #   type: external
+  #   external:
+  #     host: postgres.example.com
+  #     port: "5432"
+  #     username: harbor
+  #     password: <password>
+  #     coreDatabase: registry
+  #     sslmode: require
+  # redis:
+  #   type: external
+  #   external:
+  #     addr: redis.example.com:6379
+  #     password: <password>

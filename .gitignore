@@ -1,0 +1,14 @@
+# Helm
+chart/charts/
+*.tgz
+
+# Local dev
+dev/.cache/
+
+# Docs site
+docs/site/node_modules/
+docs/site/dist/
+docs/site/.astro/
+
+# OS
+.DS_Store

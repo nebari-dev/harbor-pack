@@ -1,0 +1,94 @@
+{{/*
+  NebariApp Custom Resource
+  --------------------------
+  The integration point with Nebari. Points the nebari-operator at Harbor's
+  upstream nginx front Service and declares routing, the landing-page card, and
+  Keycloak SSO.
+
+  We do NOT create a Deployment/Service here - the wrapped Harbor subchart does.
+  auth.enforceAtGateway is false: Harbor performs OIDC itself and CLI clients use
+  Basic auth against Harbor's token endpoint, so the operator provisions the
+  Keycloak client + Secret but does not create an Envoy SecurityPolicy.
+*/}}
+{{- if .Values.nebariapp.enabled }}
+apiVersion: reconcilers.nebari.dev/v1
+kind: NebariApp
+metadata:
+  name: {{ include "harbor-pack.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "harbor-pack.labels" . | nindent 4 }}
+spec:
+  hostname: {{ required "nebariapp.hostname is required when nebariapp.enabled is true" .Values.nebariapp.hostname }}
+  serviceAccountName: {{ include "harbor-pack.fullname" . }}
+  service:
+    name: {{ .Values.nebariapp.service.name | default (include "harbor-pack.harbor-service-name" .) }}
+    port: {{ .Values.nebariapp.service.port | default (include "harbor-pack.harbor-service-port" .) }}
+  {{- with .Values.nebariapp.routing }}
+  routing:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with .Values.nebariapp.auth }}
+  auth:
+    enabled: {{ .enabled | default false }}
+    provider: {{ .provider | default "keycloak" }}
+    provisionClient: {{ .provisionClient | default true }}
+    enforceAtGateway: {{ .enforceAtGateway | default false }}
+    {{- with .redirectURI }}
+    redirectURI: {{ . | quote }}
+    {{- end }}
+    {{- with .scopes }}
+    scopes:
+      {{- toYaml . | nindent 6 }}
+    {{- end }}
+    {{- with .groups }}
+    groups:
+      {{- toYaml . | nindent 6 }}
+    {{- end }}
+    {{- with .keycloakConfig }}
+    keycloakConfig:
+      {{- toYaml . | nindent 6 }}
+    {{- end }}
+  {{- end }}
+  {{- with .Values.nebariapp.gateway }}
+  gateway: {{ . }}
+  {{- end }}
+  {{- with .Values.nebariapp.landingPage }}
+  landingPage:
+    enabled: {{ .enabled | default false }}
+    {{- with .displayName }}
+    displayName: {{ . | quote }}
+    {{- end }}
+    {{- with .description }}
+    description: {{ . | quote }}
+    {{- end }}
+    {{- with .icon }}
+    icon: {{ . | quote }}
+    {{- end }}
+    {{- with .category }}
+    category: {{ . | quote }}
+    {{- end }}
+    {{- if kindIs "float64" .priority }}
+    priority: {{ .priority }}
+    {{- end }}
+    {{- with .externalUrl }}
+    externalUrl: {{ . | quote }}
+    {{- end }}
+    {{- with .healthCheck }}
+    healthCheck:
+      enabled: {{ .enabled | default false }}
+      {{- with .path }}
+      path: {{ . | quote }}
+      {{- end }}
+      {{- if kindIs "float64" .port }}
+      port: {{ .port }}
+      {{- end }}
+      {{- if kindIs "float64" .intervalSeconds }}
+      intervalSeconds: {{ .intervalSeconds }}
+      {{- end }}
+      {{- if kindIs "float64" .timeoutSeconds }}
+      timeoutSeconds: {{ .timeoutSeconds }}
+      {{- end }}
+    {{- end }}
+  {{- end }}
+{{- end }}

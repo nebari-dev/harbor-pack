@@ -1,0 +1,141 @@
+{{/*
+  Harbor OIDC configuration Job
+  -----------------------------
+  Harbor stores its auth/OIDC settings in its database and exposes them through
+  the config API (PUT /api/v2.0/configurations) - they are NOT settable via Helm
+  values. This post-install/upgrade hook reads the OIDC client credentials the
+  nebari-operator provisioned into <nebariapp-fullname>-oidc-client and switches
+  Harbor into oidc_auth mode pointing at Keycloak.
+
+  Rendered only when Nebari auth AND oidcSetup are enabled. The Job runs as the
+  NebariApp's ServiceAccount (same name as the NebariApp), which the operator
+  grants read access to the OIDC Secret.
+*/}}
+{{- if and .Values.nebariapp.enabled .Values.nebariapp.auth.enabled .Values.oidcSetup.enabled }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "harbor-pack.fullname" . }}-oidc-setup
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "harbor-pack.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "5"
+    "helm.sh/hook-delete-policy": before-hook-creation
+spec:
+  backoffLimit: 10
+  # Clean up automatically 10 minutes after completion (requires TTL controller).
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      labels:
+        {{- include "harbor-pack.selectorLabels" . | nindent 8 }}
+    spec:
+      restartPolicy: Never
+      serviceAccountName: {{ include "harbor-pack.fullname" . }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+      containers:
+        - name: configure-oidc
+          image: {{ .Values.oidcSetup.image | quote }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          env:
+            - name: HARBOR_API
+              value: "http://{{ include "harbor-pack.harbor-service-name" . }}:{{ include "harbor-pack.harbor-service-port" . }}/api/v2.0"
+            - name: OIDC_NAME
+              value: {{ .Values.oidcSetup.oidcName | quote }}
+            - name: OIDC_SCOPE
+              value: {{ .Values.nebariapp.auth.scopes | join "," | quote }}
+            - name: OIDC_GROUPS_CLAIM
+              value: {{ .Values.oidcSetup.groupsClaim | quote }}
+            - name: OIDC_ADMIN_GROUP
+              value: {{ .Values.oidcSetup.adminGroup | default "" | quote }}
+            - name: OIDC_USER_CLAIM
+              value: {{ .Values.oidcSetup.userClaim | quote }}
+            - name: OIDC_AUTO_ONBOARD
+              value: {{ .Values.oidcSetup.autoOnboard | quote }}
+            - name: OIDC_VERIFY_CERT
+              value: {{ .Values.oidcSetup.verifyCert | quote }}
+            - name: OIDC_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "harbor-pack.oidc-secret-name" . }}
+                  key: client-id
+            - name: OIDC_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "harbor-pack.oidc-secret-name" . }}
+                  key: client-secret
+            - name: OIDC_ENDPOINT
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "harbor-pack.oidc-secret-name" . }}
+                  key: issuer-url
+            - name: HARBOR_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "harbor-pack.admin-secret-name" . }}
+                  key: {{ .Values.oidcSetup.adminPasswordKey | quote }}
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+
+              echo "Waiting for Harbor API at ${HARBOR_API} ..."
+              i=0
+              until curl -sf -o /dev/null "${HARBOR_API}/health"; do
+                i=$((i + 1))
+                if [ "$i" -ge 60 ]; then
+                  echo "Harbor API not healthy after ~5m; giving up." >&2
+                  exit 1
+                fi
+                sleep 5
+              done
+              echo "Harbor API is healthy."
+
+              # Build the configuration payload. jq is not present in curl images,
+              # so assemble JSON by hand with printf (values come from Keycloak /
+              # the operator Secret and contain no embedded quotes).
+              PAYLOAD=$(printf '{
+                "auth_mode": "oidc_auth",
+                "oidc_name": "%s",
+                "oidc_endpoint": "%s",
+                "oidc_client_id": "%s",
+                "oidc_client_secret": "%s",
+                "oidc_scope": "%s",
+                "oidc_groups_claim": "%s",
+                "oidc_admin_group": "%s",
+                "oidc_user_claim": "%s",
+                "oidc_auto_onboard": %s,
+                "oidc_verify_cert": %s
+              }' "$OIDC_NAME" "$OIDC_ENDPOINT" "$OIDC_CLIENT_ID" "$OIDC_CLIENT_SECRET" \
+                 "$OIDC_SCOPE" "$OIDC_GROUPS_CLAIM" "$OIDC_ADMIN_GROUP" "$OIDC_USER_CLAIM" \
+                 "$OIDC_AUTO_ONBOARD" "$OIDC_VERIFY_CERT")
+
+              echo "Configuring Harbor OIDC (endpoint: ${OIDC_ENDPOINT}) ..."
+              STATUS=$(curl -s -o /tmp/resp.txt -w '%{http_code}' \
+                -X PUT "${HARBOR_API}/configurations" \
+                -u "admin:${HARBOR_ADMIN_PASSWORD}" \
+                -H "Content-Type: application/json" \
+                -d "$PAYLOAD")
+
+              if [ "$STATUS" != "200" ]; then
+                echo "Failed to configure OIDC (HTTP ${STATUS}):" >&2
+                cat /tmp/resp.txt >&2
+                exit 1
+              fi
+              echo "Harbor OIDC configuration applied successfully."
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+{{- end }}

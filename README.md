@@ -1,0 +1,145 @@
+# harbor-pack
+
+A [Nebari](https://www.nebari.dev/) software pack that runs [Harbor](https://goharbor.io/)
+— a CNCF, OCI-compliant registry for container images, Helm charts, and OCI artifacts, with
+built-in Trivy vulnerability scanning and RBAC. This pack wraps the upstream Harbor Helm
+chart and adds Nebari integration: gateway routing, a landing-page card, and **Keycloak SSO**.
+
+- **Who it's for:** Nebari platform teams and their users who need a private, self-hosted
+  registry for images and OCI artifacts, with single sign-on.
+- **Level:** `alpha` (see [`pack-metadata.yaml`](pack-metadata.yaml)). Installs and runs the
+  happy path on a current Nebari dev cluster; APIs and values may change.
+
+## How it works
+
+| Concern | How the pack handles it |
+|---|---|
+| Deployment | Wraps `harbor/harbor` (chart `1.19.1`, app `2.15.1`) as a Helm subchart under the `harbor:` values key. |
+| Routing / TLS | A `NebariApp` CR points the nebari-operator at Harbor's nginx front Service; the shared gateway terminates TLS and routes to it. |
+| Landing card | `NebariApp.spec.landingPage` renders a Harbor card on the Nebari landing page. |
+| **SSO** | The operator provisions a Keycloak OIDC client + Secret; a post-install Job switches Harbor into `oidc_auth` mode using those credentials. See [Authentication](#authentication). |
+| Storage | Bundled Postgres/Redis + filesystem registry storage by default; toggles for S3/MinIO object storage and external managed Postgres/Redis. |
+
+## Prerequisites
+
+- A Nebari cluster with the **nebari-operator**, **Envoy Gateway**, **cert-manager**, and
+  **Keycloak** (the standard NIC stack).
+- The install namespace labeled for the operator:
+  `kubectl label namespace <ns> nebari.dev/managed=true --overwrite`.
+- A Harbor admin password supplied at install time (never commit one).
+- For production: an object-storage bucket (S3/MinIO) and/or managed Postgres + Redis if you
+  switch off the bundled backends.
+
+## Quick start (on Nebari)
+
+```sh
+kubectl create namespace harbor
+kubectl label namespace harbor nebari.dev/managed=true --overwrite
+
+helm install harbor ./chart -n harbor \
+  -f examples/nebari-values.yaml \
+  --set nebariapp.hostname=harbor.nebari.example.com \
+  --set harbor.externalURL=https://harbor.nebari.example.com \
+  --set harbor.harborAdminPassword="$(openssl rand -base64 24)"
+```
+
+Then:
+
+```sh
+kubectl get nebariapp harbor-harbor-pack -n harbor        # wait for Ready
+kubectl get job harbor-harbor-pack-oidc-setup -n harbor   # should Complete
+```
+
+Open `https://harbor.nebari.example.com` and click **LOGIN VIA OIDC PROVIDER**.
+
+## Standalone (local, no Nebari)
+
+```sh
+helm dependency update ./chart
+helm install harbor ./chart -n harbor --create-namespace -f examples/standalone-values.yaml
+kubectl -n harbor port-forward svc/harbor 8080:80
+# open http://localhost:8080  (admin / Harbor12345)
+```
+
+## Authentication
+
+Harbor performs OIDC **itself** (the portal shows a "Login via OIDC Provider" button), and
+CLI clients (`docker`, `oras`, `helm`) authenticate with Basic auth using a per-user **CLI
+secret** or a **robot account** against Harbor's own token endpoint. Because of this:
+
+- `nebariapp.auth.enforceAtGateway` is **`false`** and must stay that way. The operator still
+  provisions the Keycloak client and the `harbor-harbor-pack-oidc-client` Secret, but does
+  **not** create an Envoy `SecurityPolicy`. Gateway-enforced browser OAuth would break
+  `docker login` and CLI push/pull.
+- `nebariapp.auth.redirectURI` is `/c/oidc/callback` (Harbor's callback), which the operator
+  registers on the Keycloak client.
+- `offline_access` is included in the requested scopes so Harbor can refresh tokens and mint
+  CLI secrets.
+
+Harbor's OIDC settings live in its database (not Helm values), so the
+`harbor-harbor-pack-oidc-setup` Job reads the operator-created Secret and calls
+`PUT /api/v2.0/configurations` to enable `oidc_auth`. The Job runs as the NebariApp's
+ServiceAccount, which the operator grants read access to the OIDC Secret.
+
+### Pushing images / artifacts
+
+```sh
+# In the Harbor UI: create a project, then "User Profile → generate CLI secret".
+docker login harbor.nebari.example.com          # username + CLI secret
+docker tag alpine harbor.nebari.example.com/library/alpine:latest
+docker push harbor.nebari.example.com/library/alpine:latest
+```
+
+## Storage & backing services
+
+Defaults are bundled (Harbor's in-chart Postgres/Redis on PVCs, filesystem registry storage)
+for a quick start. For production, switch to object storage and external managed backends via
+the `harbor.*` values — see the commented blocks in [`chart/values.yaml`](chart/values.yaml)
+and [`examples/nebari-values.yaml`](examples/nebari-values.yaml):
+
+- Registry backend → `harbor.persistence.imageChartStorage.type: s3` + `.s3.*`
+- Database → `harbor.database.type: external` + `harbor.database.external.*`
+- Redis → `harbor.redis.type: external` + `harbor.redis.external.*`
+
+## Values reference (pack-specific)
+
+| Key | Default | Description |
+|---|---|---|
+| `nebariapp.enabled` | `false` | Emit the `NebariApp` CR (set true on Nebari). |
+| `nebariapp.hostname` | — | Required when enabled; Harbor's external hostname. |
+| `nebariapp.manageNamespace` | `false` | Emit a `nebari.dev/managed` Namespace (else label it yourself). |
+| `nebariapp.auth.enabled` | `true` | Provision the Keycloak OIDC client. |
+| `nebariapp.auth.enforceAtGateway` | `false` | Keep false — Harbor does OIDC itself. |
+| `nebariapp.auth.redirectURI` | `/c/oidc/callback` | Harbor's OIDC callback path. |
+| `nebariapp.auth.scopes` | `[openid, profile, email, offline_access, groups]` | Requested OIDC scopes. |
+| `nebariapp.landingPage.*` | Harbor card | Landing-page card metadata. |
+| `oidcSetup.enabled` | `true` | Run the Job that switches Harbor to `oidc_auth`. |
+| `oidcSetup.adminGroup` | `""` | Keycloak group mapped to Harbor system-admin. |
+| `oidcSetup.autoOnboard` | `true` | Auto-create Harbor users on first OIDC login. |
+| `harbor.*` | — | Passed to the upstream Harbor chart. |
+
+## Troubleshooting
+
+- **NebariApp stuck / `NamespaceNotOptedIn`** — label the namespace:
+  `kubectl label ns <ns> nebari.dev/managed=true --overwrite`.
+- **OIDC-setup Job failing** — check logs:
+  `kubectl logs job/harbor-harbor-pack-oidc-setup -n <ns>`. Common causes: the OIDC Secret
+  not yet created by the operator (Job retries via `backoffLimit`), or a wrong admin password
+  (`HARBOR_ADMIN_PASSWORD` must match `harbor.harborAdminPassword`).
+- **"Login via OIDC Provider" missing** — the Job didn't complete; confirm
+  `GET /api/v2.0/configurations` shows `auth_mode=oidc_auth`.
+- **`docker login` fails** — use a **CLI secret** or robot account, not your Keycloak
+  password (OIDC users cannot use their IdP password for the registry).
+- **Keycloak `redirect_uri` error** — ensure `nebariapp.auth.redirectURI` is
+  `/c/oidc/callback` and `harbor.externalURL` matches `https://<hostname>`.
+
+## Known limitations
+
+- Object storage and external Postgres/Redis are exposed via values but exercised only via
+  `helm template` in CI (integration tests use bundled filesystem/Postgres/Redis).
+- No automated Harbor→Keycloak group→project role mapping beyond `oidc_admin_group`.
+- Upgrades follow upstream Harbor's chart; review upstream release notes before major bumps.
+
+## License
+
+Apache-2.0. See [LICENSE](LICENSE).

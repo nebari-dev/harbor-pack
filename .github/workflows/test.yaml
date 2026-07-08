@@ -1,0 +1,52 @@
+name: Test (standalone)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  standalone:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Create kind cluster
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: harbor-test
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v5
+
+      - name: Update chart dependencies
+        run: helm dependency update chart/
+
+      # Standalone install: no nebari-operator/Keycloak required. Uses bundled
+      # Postgres/Redis and filesystem registry storage.
+      - name: Install harbor-pack (NebariApp disabled)
+        run: |
+          helm install harbor chart/ \
+            --create-namespace --namespace harbor \
+            -f examples/standalone-values.yaml \
+            --wait --timeout 10m
+
+      - name: Wait for Harbor core
+        run: |
+          kubectl rollout status deploy/harbor-core -n harbor --timeout=300s
+
+      - name: Health check Harbor API
+        run: |
+          kubectl port-forward -n harbor svc/harbor 8080:80 &
+          sleep 5
+          curl -sf http://localhost:8080/api/v2.0/health
+          kill %1
+
+      - name: Confirm no NebariApp / OIDC Job rendered standalone
+        run: |
+          ! kubectl get job harbor-harbor-pack-oidc-setup -n harbor 2>/dev/null
+
+      - name: Uninstall
+        if: always()
+        run: helm uninstall harbor -n harbor --wait || true

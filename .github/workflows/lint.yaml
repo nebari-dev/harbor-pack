@@ -1,0 +1,53 @@
+name: Lint
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v5
+
+      - name: Install kubeconform
+        run: |
+          curl -sSL https://github.com/yannh/kubeconform/releases/latest/download/kubeconform-linux-amd64.tar.gz | \
+            sudo tar -xz -C /usr/local/bin kubeconform
+
+      - name: Update chart dependencies
+        run: helm dependency update chart/
+
+      - name: helm lint
+        run: helm lint chart/ --set nebariapp.hostname=harbor.example.com --set harbor.externalURL=https://harbor.example.com --set harbor.harborAdminPassword=ci
+
+      - name: Template (NebariApp disabled)
+        run: |
+          helm template harbor chart/ \
+            --set nebariapp.enabled=false \
+            --set harbor.harborAdminPassword=ci \
+            > /tmp/standalone.yaml
+          kubeconform -strict -ignore-missing-schemas -summary /tmp/standalone.yaml
+
+      - name: Template (NebariApp enabled)
+        run: |
+          helm template harbor chart/ \
+            --set nebariapp.enabled=true \
+            --set nebariapp.hostname=harbor.example.com \
+            --set harbor.externalURL=https://harbor.example.com \
+            --set harbor.harborAdminPassword=ci \
+            > /tmp/nebari.yaml
+          # -ignore-missing-schemas: NebariApp CRD schema is not bundled.
+          kubeconform -strict -ignore-missing-schemas -summary /tmp/nebari.yaml
+
+      - name: Validate pack-metadata.yaml
+        run: |
+          pip install check-jsonschema
+          check-jsonschema \
+            --schemafile https://raw.githubusercontent.com/nebari-dev/software-pack-dashboard/main/schema/pack-metadata.schema.json \
+            pack-metadata.yaml

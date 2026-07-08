@@ -1,0 +1,148 @@
+name: Integration Test (NebariApp)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+    paths:
+      - "chart/**"
+      - "examples/**"
+      - "dev/**"
+      - ".github/workflows/test-integration.yaml"
+
+jobs:
+  nebariapp-integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      CLUSTER_NAME: harbor-integration
+      OPERATOR_REF: v0.1.0-alpha.19
+      HOSTNAME: harbor.nebari.local
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Checkout nebari-operator (for dev/scripts)
+        uses: actions/checkout@v5
+        with:
+          repository: nebari-dev/nebari-operator
+          ref: ${{ env.OPERATOR_REF }}
+          path: nebari-operator
+
+      - name: Create kind cluster
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: harbor-integration
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v5
+
+      # ============================================================
+      # Infrastructure: MetalLB
+      # ============================================================
+      - name: Install MetalLB
+        run: |
+          kubectl apply -f https://raw.githubusercontent.com/metallb/metallb/v0.14.8/config/manifests/metallb-native.yaml
+          kubectl wait --namespace metallb-system \
+            --for=condition=available deployment/controller --timeout=90s
+          kubectl wait --namespace metallb-system \
+            --for=jsonpath='{.status.numberReady}'=1 daemonset/speaker --timeout=90s
+
+      - name: Configure MetalLB IP pool
+        run: |
+          KIND_NET_CIDR=$(docker network inspect kind -f '{{range .IPAM.Config}}{{.Subnet}}{{"\n"}}{{end}}' | grep '\.' | head -n1)
+          BASE_IP=$(echo "${KIND_NET_CIDR}" | awk -F. '{print $1"."$2}')
+          kubectl apply -f - <<EOF
+          apiVersion: metallb.io/v1beta1
+          kind: IPAddressPool
+          metadata:
+            name: kind-pool
+            namespace: metallb-system
+          spec:
+            addresses:
+              - ${BASE_IP}.255.200-${BASE_IP}.255.250
+          ---
+          apiVersion: metallb.io/v1beta1
+          kind: L2Advertisement
+          metadata:
+            name: kind-l2
+            namespace: metallb-system
+          spec:
+            ipAddressPools:
+              - kind-pool
+          EOF
+
+      # ============================================================
+      # Infrastructure: Envoy Gateway, cert-manager, Keycloak, operator
+      # ============================================================
+      - name: Install foundational services
+        run: nebari-operator/dev/scripts/services/install.sh
+
+      - name: Setup Keycloak realm
+        run: nebari-operator/dev/scripts/services/keycloak/setup.sh
+
+      - name: Install nebari-operator
+        run: kubectl apply -f https://github.com/nebari-dev/nebari-operator/releases/download/${OPERATOR_REF}/install.yaml
+
+      - name: Wait for nebari-operator
+        run: |
+          kubectl wait --for=condition=available deployment/nebari-operator-controller-manager \
+            -n nebari-operator-system --timeout=120s
+
+      # ============================================================
+      # Deploy harbor-pack (NebariApp + OIDC enabled)
+      # ============================================================
+      - name: Update chart dependencies
+        run: helm dependency update chart/
+
+      - name: Create + label namespace
+        run: |
+          kubectl create namespace harbor
+          kubectl label namespace harbor nebari.dev/managed=true --overwrite
+
+      - name: Install harbor-pack
+        run: |
+          helm install harbor chart/ -n harbor \
+            --set nebariapp.enabled=true \
+            --set nebariapp.hostname=${HOSTNAME} \
+            --set harbor.externalURL=https://${HOSTNAME} \
+            --set harbor.harborAdminPassword=Harbor12345 \
+            --timeout 15m --wait
+
+      - name: Verify NebariApp Ready
+        run: |
+          kubectl wait --for=condition=Ready nebariapp/harbor-harbor-pack -n harbor --timeout=180s
+          kubectl get httproute -n harbor -l app.kubernetes.io/managed-by=nebari-operator
+
+      - name: Verify operator provisioned the OIDC client Secret
+        run: |
+          kubectl get secret harbor-harbor-pack-oidc-client -n harbor \
+            -o jsonpath='{.data.client-id}' | base64 -d
+          echo " <- client-id present"
+
+      - name: Verify OIDC-setup Job completed
+        run: |
+          kubectl wait --for=condition=complete job/harbor-harbor-pack-oidc-setup -n harbor --timeout=300s
+
+      - name: Verify Harbor is in oidc_auth mode
+        run: |
+          kubectl port-forward -n harbor svc/harbor 8080:80 &
+          sleep 5
+          MODE=$(curl -sf -u admin:Harbor12345 http://localhost:8080/api/v2.0/configurations | grep -o '"auth_mode":{[^}]*}')
+          echo "$MODE"
+          echo "$MODE" | grep -q 'oidc_auth' && echo "auth_mode=oidc_auth confirmed"
+          kill %1
+
+      # ============================================================
+      # Debug on failure
+      # ============================================================
+      - name: Debug info on failure
+        if: failure()
+        run: |
+          echo "=== NebariApp ==="; kubectl describe nebariapp -n harbor || true
+          echo "=== OIDC Job logs ==="; kubectl logs job/harbor-harbor-pack-oidc-setup -n harbor --tail=100 || true
+          echo "=== HTTPRoutes ==="; kubectl get httproute -A || true
+          echo "=== Operator logs ==="; kubectl logs -n nebari-operator-system deployment/nebari-operator-controller-manager --tail=100 || true
+          echo "=== Pods ==="; kubectl get pods -n harbor || true
+          echo "=== Events ==="; kubectl get events -n harbor --sort-by=.lastTimestamp | tail -50 || true

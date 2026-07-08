@@ -1,0 +1,21 @@
+# Standalone deployment (no Nebari operator, no Keycloak) - e.g. local kind/k3d.
+#
+#   helm install harbor . -n harbor --create-namespace -f standalone-values.yaml
+#   kubectl -n harbor port-forward svc/harbor 8080:80
+#   open http://localhost:8080   # admin / Harbor12345
+#
+# Not for production - uses a default admin password and internal Postgres/Redis.
+
+nebariapp:
+  enabled: false
+
+oidcSetup:
+  enabled: false
+
+harbor:
+  externalURL: http://localhost:8080
+  harborAdminPassword: Harbor12345
+  expose:
+    type: clusterIP
+    tls:
+      enabled: false

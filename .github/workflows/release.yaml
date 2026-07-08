@@ -1,0 +1,95 @@
+name: Release Chart
+
+on:
+  workflow_dispatch: {}
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+-*"
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pages: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Configure Git
+        run: |
+          git config user.name "$GITHUB_ACTOR"
+          git config user.email "$GITHUB_ACTOR@users.noreply.github.com"
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v5
+
+      - name: Update dependencies
+        run: helm dependency update chart/
+
+      - name: Get chart version
+        id: chart
+        run: |
+          echo "version=$(grep '^version:' chart/Chart.yaml | awk '{print $2}')" >> $GITHUB_OUTPUT
+          echo "name=$(grep '^name:' chart/Chart.yaml | awk '{print $2}')" >> $GITHUB_OUTPUT
+
+      - name: Check if release exists
+        id: check
+        run: |
+          if gh release view "${{ steps.chart.outputs.name }}-${{ steps.chart.outputs.version }}" &>/dev/null; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Package chart
+        if: steps.check.outputs.exists == 'false'
+        run: helm package chart/
+
+      - name: Create GitHub release
+        if: steps.check.outputs.exists == 'false'
+        run: |
+          gh release create "${{ steps.chart.outputs.name }}-${{ steps.chart.outputs.version }}" \
+            --title "${{ steps.chart.outputs.name }}-${{ steps.chart.outputs.version }}" \
+            --generate-notes \
+            *.tgz
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update Helm repo index
+        if: steps.check.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          GH_PAGES_URL="https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
+          REPO_URL="https://github.com/${{ github.repository }}/releases/download/${{ steps.chart.outputs.name }}-${{ steps.chart.outputs.version }}"
+
+          if git ls-remote --exit-code --heads "${GH_PAGES_URL}" gh-pages >/dev/null 2>&1; then
+            git clone --depth 1 --branch gh-pages "${GH_PAGES_URL}" gh-pages
+          else
+            mkdir -p gh-pages
+            git -C gh-pages init -b gh-pages
+            git -C gh-pages remote add origin "${GH_PAGES_URL}"
+          fi
+
+          cp *.tgz gh-pages/
+          cd gh-pages
+
+          if [ -f index.yaml ]; then
+            helm repo index . --url "${REPO_URL}" --merge index.yaml
+          else
+            helm repo index . --url "${REPO_URL}"
+          fi
+
+          git config user.name "$GITHUB_ACTOR"
+          git config user.email "$GITHUB_ACTOR@users.noreply.github.com"
+          git add .
+          git commit -m "Release ${{ steps.chart.outputs.name }}-${{ steps.chart.outputs.version }}"
+          git push origin gh-pages

@@ -1,0 +1,171 @@
+# Default values for harbor-pack.
+# This chart wraps the upstream Harbor chart (https://helm.goharbor.io) and adds
+# Nebari integration: a NebariApp CR (routing + landing-page card + Keycloak SSO)
+# and a post-install Job that switches Harbor into OIDC auth mode.
+
+# =============================================================================
+# Nebari Integration
+# =============================================================================
+# Creates a NebariApp CR that tells the nebari-operator how to route to Harbor,
+# provision a Keycloak OIDC client, and show a landing-page card.
+# Set enabled: true when deploying on a Nebari cluster.
+nebariapp:
+  enabled: false
+  # hostname: harbor.nebari.example.com   # REQUIRED when enabled. Harbor's externalURL
+  #                                         # and OIDC redirect are derived from this.
+  # Emit a Namespace object labeled nebari.dev/managed=true. Leave false and label
+  # the namespace out-of-band (kubectl label ns <ns> nebari.dev/managed=true) to
+  # avoid Helm ownership conflicts with `--create-namespace`.
+  manageNamespace: false
+  service:
+    name: ""      # Defaults to the upstream Harbor front service (harbor.expose.clusterIP.name).
+    port: 80
+  routing:
+    routes:
+      - pathPrefix: /
+        pathType: PathPrefix
+    tls:
+      enabled: true
+  auth:
+    enabled: true
+    provider: keycloak
+    provisionClient: true
+    # Harbor performs OIDC itself and CLI clients (docker/oras/helm) authenticate
+    # with Basic auth (CLI secret / robot accounts) against Harbor's own token
+    # endpoint. Gateway-enforced browser OAuth would break those flows, so this
+    # MUST stay false. The operator still provisions the Keycloak client + Secret.
+    enforceAtGateway: false
+    # Harbor's OIDC callback path. The operator registers this on the Keycloak client.
+    redirectURI: /c/oidc/callback
+    # offline_access is required so Harbor can refresh tokens / mint CLI secrets.
+    scopes:
+      - openid
+      - profile
+      - email
+      - offline_access
+      - groups
+    # groups: [harbor-users]   # Optional: restrict access to these Keycloak groups.
+  landingPage:
+    enabled: true
+    displayName: Harbor
+    description: Container image & OCI artifact registry with vulnerability scanning.
+    # No built-in icon for Harbor; use the upstream logo URL.
+    icon: https://goharbor.io/img/logos/harbor-icon-color.png
+    category: Platform
+    priority: 100
+    healthCheck:
+      enabled: true
+      path: /api/v2.0/health
+      port: 80
+  gateway: public
+
+# =============================================================================
+# Harbor OIDC configuration Job
+# =============================================================================
+# Harbor stores its OIDC settings in its database (set via the config API), not
+# via Helm values. This post-install/upgrade hook Job reads the operator-created
+# OIDC Secret (<nebariapp-fullname>-oidc-client) and PUTs /api/v2.0/configurations
+# to switch Harbor into oidc_auth mode. Rendered only when both this and
+# nebariapp.auth.enabled are true.
+oidcSetup:
+  enabled: true
+  image: curlimages/curl:8.11.0
+  oidcName: keycloak
+  groupsClaim: groups
+  # adminGroup: harbor-admins   # Optional Keycloak group mapped to Harbor system admin.
+  userClaim: preferred_username
+  autoOnboard: true
+  verifyCert: true
+  # Harbor admin credentials. The upstream chart writes them to the core Secret;
+  # leave these empty to read from that Secret (name/key computed by default), or
+  # override to point at your own Secret.
+  adminPasswordSecret: ""   # Defaults to "<harbor-fullname>-core".
+  adminPasswordKey: HARBOR_ADMIN_PASSWORD
+
+# =============================================================================
+# Harbor (upstream subchart) overrides
+# =============================================================================
+# Everything under `harbor:` is passed to the upstream Harbor chart.
+# See https://github.com/goharbor/harbor-helm for the full values reference.
+harbor:
+  # Set to https://<nebariapp.hostname>. Required for correct token-service and
+  # OIDC redirect URLs. See examples/nebari-values.yaml.
+  externalURL: ""
+
+  expose:
+    # The Nebari gateway terminates TLS and routes to this ClusterIP service, so
+    # Harbor should not manage its own ingress or TLS.
+    type: clusterIP
+    tls:
+      enabled: false
+    clusterIP:
+      name: harbor
+      ports:
+        httpPort: 80
+
+  # Do not commit a real password. Set via examples/secret at deploy time.
+  harborAdminPassword: ""
+
+  # --- Storage: bundled defaults (quick start) --------------------------------
+  # Registry blobs, DB, redis, trivy cache, and job logs all use PVCs by default.
+  persistence:
+    enabled: true
+    resourcePolicy: keep
+    persistentVolumeClaim:
+      registry:
+        size: 50Gi
+      jobservice:
+        jobLog:
+          size: 5Gi
+      database:
+        size: 5Gi
+      redis:
+        size: 5Gi
+      trivy:
+        size: 5Gi
+    imageChartStorage:
+      # Registry backend. Default filesystem (PVC above).
+      # Toggle to object storage for production:
+      #   type: s3
+      #   s3:
+      #     region: us-east-1
+      #     bucket: harbor-registry
+      #     accesskey: ...
+      #     secretkey: ...
+      #     regionendpoint: https://minio.example.com   # for MinIO/S3-compatible
+      #     secure: true
+      type: filesystem
+
+  # --- Backing services: bundled by default -----------------------------------
+  database:
+    type: internal
+    # Toggle to external managed Postgres for production:
+    #   type: external
+    #   external:
+    #     host: postgres.example.com
+    #     port: "5432"
+    #     username: harbor
+    #     password: ...
+    #     coreDatabase: registry
+    #     sslmode: require
+  redis:
+    type: internal
+    # Toggle to external managed Redis for production:
+    #   type: external
+    #   external:
+    #     addr: redis.example.com:6379
+    #     password: ...
+
+  # Vulnerability scanning on by default.
+  trivy:
+    enabled: true
+
+  # Prometheus metrics for a ServiceMonitor.
+  metrics:
+    enabled: true
+
+# =============================================================================
+# Overrides
+# =============================================================================
+nameOverride: ""
+fullnameOverride: ""

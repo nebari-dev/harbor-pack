@@ -1,0 +1,16 @@
+# Nebari software-pack dashboard metadata.
+# Schema: nebari-dev/software-pack-dashboard/schema/pack-metadata.schema.json
+# Validate: check-jsonschema --schemafile <schema-url> pack-metadata.yaml
+name: harbor-pack
+display_name: Harbor Pack
+level: alpha
+owner: jbouder
+product_owner: null
+deprecated: false
+nebariapp_integration: full
+scope:
+  standalone-supported: yes
+docs_site: true
+links:
+  docs: https://packs.nebari.dev/harbor-pack/
+demo_notes: ""

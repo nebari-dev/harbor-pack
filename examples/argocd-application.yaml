@@ -1,0 +1,37 @@
+# Deploy harbor-pack via ArgoCD from the published Helm repo.
+# Update targetRevision to the released chart version and repoURL to the
+# nebari-dev Helm repository once published.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: harbor-pack
+  namespace: argocd
+spec:
+  project: default
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: harbor
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      # The namespace must carry nebari.dev/managed=true; apply it via a
+      # namespace manifest in a separate source or manage it out-of-band.
+  source:
+    repoURL: https://nebari-dev.github.io/helm-repository
+    chart: harbor-pack
+    targetRevision: 0.1.0
+    helm:
+      values: |
+        nebariapp:
+          enabled: true
+          hostname: harbor.nebari.example.com
+          auth:
+            enabled: true
+        oidcSetup:
+          enabled: true
+        harbor:
+          externalURL: https://harbor.nebari.example.com
+          harborAdminPassword: ""   # supply via a secret / parameter override

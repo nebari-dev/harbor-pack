@@ -1,0 +1,19 @@
+apiVersion: v2
+name: harbor-pack
+description: Harbor OCI registry (container images, Helm charts, OCI artifacts) with Trivy vulnerability scanning and Keycloak SSO, for Nebari.
+type: application
+# EffVer (https://jacobtomlinson.dev/effver/): pre-1.0 collapses to 0.MACRO.MICRO.
+version: 0.1.0
+# Matches the wrapped upstream Harbor application version.
+appVersion: "2.15.1"
+home: https://github.com/nebari-dev/harbor-pack
+sources:
+  - https://github.com/nebari-dev/harbor-pack
+  - https://github.com/goharbor/harbor
+maintainers:
+  - name: OpenTeams
+    email: info@openteams.com
+dependencies:
+  - name: harbor
+    version: "1.19.1"
+    repository: https://helm.goharbor.io

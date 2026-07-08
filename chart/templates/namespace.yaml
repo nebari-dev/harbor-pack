@@ -1,0 +1,15 @@
+{{/*
+  Label the release namespace so the nebari-operator will reconcile NebariApp
+  resources in it. Without the nebari.dev/managed=true label the operator
+  ignores the namespace (NamespaceNotOptedIn). Only rendered when integrating
+  with Nebari; disable if the namespace is managed elsewhere.
+*/}}
+{{- if and .Values.nebariapp.enabled .Values.nebariapp.manageNamespace }}
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ .Release.Namespace }}
+  labels:
+    nebari.dev/managed: "true"
+    {{- include "harbor-pack.labels" . | nindent 4 }}
+{{- end }}

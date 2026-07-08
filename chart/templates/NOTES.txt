@@ -1,0 +1,36 @@
+{{ include "harbor-pack.fullname" . }} has been deployed (Harbor {{ .Chart.AppVersion }}).
+
+{{- if .Values.nebariapp.enabled }}
+
+NebariApp is ENABLED. The nebari-operator will configure:
+  - HTTPRoute + TLS for hostname: {{ .Values.nebariapp.hostname }}
+  {{- if .Values.nebariapp.auth.enabled }}
+  - A Keycloak OIDC client (Secret: {{ include "harbor-pack.oidc-secret-name" . }})
+  {{- if .Values.oidcSetup.enabled }}
+  - Harbor OIDC login (configured by the post-install Job "{{ include "harbor-pack.fullname" . }}-oidc-setup")
+  {{- end }}
+  {{- end }}
+
+Make sure the namespace is opted in:
+  kubectl label namespace {{ .Release.Namespace }} nebari.dev/managed=true --overwrite
+
+Check status:
+  kubectl get nebariapp {{ include "harbor-pack.fullname" . }} -n {{ .Release.Namespace }}
+  {{- if .Values.oidcSetup.enabled }}
+  kubectl get job {{ include "harbor-pack.fullname" . }}-oidc-setup -n {{ .Release.Namespace }}
+  {{- end }}
+
+Open Harbor at: https://{{ .Values.nebariapp.hostname }}
+  - Web UI: click "LOGIN VIA OIDC PROVIDER"
+  - CLI: log in to the portal, generate a CLI secret (or a robot account), then
+    `docker login {{ .Values.nebariapp.hostname }}`
+
+{{- else }}
+
+NebariApp is DISABLED (standalone mode). Access Harbor locally:
+
+  kubectl port-forward svc/{{ include "harbor-pack.harbor-service-name" . }} 8080:{{ include "harbor-pack.harbor-service-port" . }} -n {{ .Release.Namespace }}
+
+Then open http://localhost:8080 (admin / <harbor.harborAdminPassword>).
+
+{{- end }}
