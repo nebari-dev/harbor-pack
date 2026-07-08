@@ -132,6 +132,6 @@ test('Pagefind search bundle is emitted and the unique term is indexable', () =>
 test('edit links point to the correct GitHub source file', () => {
   const html = readPage('auth-flow');
   expect(html).toContain(
-    'https://github.com/nebari-dev/harbor-pack/edit/main/docs/site/src/content/docs/auth-flow.md',
+    'https://github.com/nebari-dev/harbor-pack/edit/main/docs/src/content/docs/auth-flow.md',
   );
 });

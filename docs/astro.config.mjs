@@ -30,7 +30,7 @@ export default defineConfig({
       editLink: {
         // Starlight appends the source path (src/content/docs/<file>.md) to this base,
         // so it must point at the Astro project root inside the repo.
-        baseUrl: 'https://github.com/nebari-dev/harbor-pack/edit/main/docs/site/',
+        baseUrl: 'https://github.com/nebari-dev/harbor-pack/edit/main/docs/',
       },
       sidebar: [
         {
@@ -38,6 +38,7 @@ export default defineConfig({
           items: [
             { label: 'Introduction', link: '/' },
             { label: 'Installation', link: '/installation/' },
+            { label: 'Local Development', link: '/local-development/' },
             { label: 'Authentication', link: '/authentication/' },
             { label: 'Configuration', link: '/configuration/' },
           ],
