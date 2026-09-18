@@ -96,6 +96,42 @@ spec:
               AUTH="admin:${HARBOR_ADMIN_PASSWORD}"
               # Tell Harbor the {project_name_or_id} path parameter is a name.
               NAME_HDR="X-Is-Resource-Name: true"
+              # Harbor's maximum page size. This Job reads a single page and
+              # refuses to guess if a listing is larger (see fetch_page).
+              PAGE_SIZE=100
+
+              # fetch_page <label> <out-file> <curl args...>
+              # GET one page of a Harbor list API, write it to <out-file> with
+              # one JSON object per line, and set LIST_TOTAL from the response's
+              # X-Total-Count. Fails when the result set does not fit the single
+              # page we read, rather than silently looking at a truncated list.
+              fetch_page() {
+                label="$1"
+                out="$2"
+                shift 2
+                LIST_TOTAL=""
+                status=$(curl -s -D /tmp/hdr.txt -o /tmp/page.json -w '%{http_code}' \
+                  -u "$AUTH" -H "$NAME_HDR" "$@")
+                if [ "$status" != "200" ]; then
+                  echo "${label}: listing failed (HTTP ${status}):" >&2
+                  cat /tmp/page.json >&2
+                  return 1
+                fi
+                # Header names are case-insensitive; strip spaces and the CR.
+                LIST_TOTAL=$(grep -i '^x-total-count:' /tmp/hdr.txt | tr -d ' \r' | cut -d: -f2)
+                case "$LIST_TOTAL" in ''|*[!0-9]*) LIST_TOTAL="" ;; esac
+                if [ -n "$LIST_TOTAL" ] && [ "$LIST_TOTAL" -gt "$PAGE_SIZE" ]; then
+                  echo "${label}: ${LIST_TOTAL} entries exceed the ${PAGE_SIZE} this Job reads in one page - cannot verify idempotently; reduce or dedupe them manually." >&2
+                  return 1
+                fi
+                # Split the JSON array into one object per line. Harbor marshals
+                # compact JSON (no spaces after commas), and a double quote
+                # inside a JSON string is always escaped as \", so the literal
+                # byte sequence },{" can only ever be an object boundary - it
+                # cannot occur inside a value such as a group named team},{ops.
+                # (Our own values can contain no " at all: render-rejected.)
+                sed 's/},{"/}\n{"/g' /tmp/page.json > "$out"
+              }
 
               # ensure_project <name> <public:true|false>
               ensure_project() {
@@ -134,19 +170,18 @@ spec:
                 group="$2"
                 role_id="$3"
                 # Look the group up first so re-runs stay quiet. The entityname
-                # filter is fuzzy and returns USERS as well as groups, so split
-                # the (flat) member objects one per line and require the same
-                # line to carry both the exact entity_name and entity_type "g" -
-                # otherwise a user who happens to share the group's name would
-                # silently suppress the group grant. Harbor emits compact JSON,
-                # hence the fixed-string greps. If this ever misses, the 409
-                # below still keeps the Job idempotent.
-                if curl -s -G -u "$AUTH" -H "$NAME_HDR" \
-                     --data-urlencode "entityname=${group}" \
-                     --data-urlencode "page_size=100" \
-                     "${HARBOR_API}/projects/${name}/members" \
-                   | sed 's/},{/}\n{/g' \
-                   | grep -F "\"entity_name\":\"${group}\"" \
+                # filter is fuzzy and returns USERS as well as groups, so with
+                # one member object per line, require the same line to carry
+                # both the exact entity_name and entity_type "g" - otherwise a
+                # user who happens to share the group's name would silently
+                # suppress the group grant. Harbor emits compact JSON, hence the
+                # fixed-string greps. If this ever misses, the 409 below still
+                # keeps the Job idempotent.
+                fetch_page "project ${name}: members of ${group}" /tmp/members.txt \
+                  -G --data-urlencode "entityname=${group}" \
+                  --data-urlencode "page_size=${PAGE_SIZE}" \
+                  "${HARBOR_API}/projects/${name}/members"
+                if grep -F "\"entity_name\":\"${group}\"" /tmp/members.txt \
                    | grep -qF '"entity_type":"g"'; then
                   echo "project ${name}: group ${group} is already a member"
                   return 0
@@ -178,35 +213,37 @@ spec:
                 # Harbor does NOT reject an equivalent duplicate immutable rule
                 # (it inserts without comparing selectors), so unlike projects
                 # and members this lookup is the only thing keeping re-runs
-                # idempotent - it has to be right.
-                # page_size=100 is Harbor's maximum; a project with more rules
-                # than that cannot be checked in one page, so bail out loudly
-                # rather than silently duplicating rules.
-                status=$(curl -s -o /tmp/rules.json -w '%{http_code}' -u "$AUTH" \
-                  -H "$NAME_HDR" \
-                  "${HARBOR_API}/projects/${name}/immutabletagrules?page_size=100")
-                if [ "$status" != "200" ]; then
-                  echo "project ${name}: listing immutable rules failed (HTTP ${status}):" >&2
-                  cat /tmp/rules.json >&2
-                  return 1
-                fi
-                # Put each rule on its own line ("id" only ever opens a rule
-                # object) and keep only lines carrying both selector keys. grep
+                # idempotent - it has to be right, and must fail loudly rather
+                # than half-read the rule list.
+                fetch_page "project ${name}: immutable tag rules" /tmp/rules.raw \
+                  "${HARBOR_API}/projects/${name}/immutabletagrules?page_size=${PAGE_SIZE}"
+                # Keep only lines holding a whole rule (both selector keys); grep
                 # also guarantees a trailing newline for the read loop below.
-                sed 's/{"id":/\n{"id":/g' /tmp/rules.json \
-                  | grep '"tag_selectors"' \
-                  | grep '"scope_selectors"' > /tmp/rules.txt || true
-                if [ "$(wc -l < /tmp/rules.txt)" -ge 100 ]; then
-                  echo "project ${name}: 100+ immutable tag rules returned (page limit) - cannot verify idempotently; dedupe them manually." >&2
+                grep '"tag_selectors":' /tmp/rules.raw \
+                  | grep '"scope_selectors":' > /tmp/rules.txt || true
+                kept=$(wc -l < /tmp/rules.txt)
+                # A rule with several tag/scope selectors would split across
+                # lines and be dropped by the filter above; comparing against
+                # X-Total-Count catches that instead of creating a duplicate.
+                if [ -n "$LIST_TOTAL" ] && [ "$kept" -ne "$LIST_TOTAL" ]; then
+                  echo "project ${name}: could only parse ${kept} of ${LIST_TOTAL} immutable tag rules - refusing to risk a duplicate; reconcile them manually." >&2
                   return 1
                 fi
                 while IFS= read -r rule; do
                   # Compare the tag pattern only against the tag_selectors half
                   # of THIS rule and the repo pattern only against its
                   # scope_selectors half, so a pattern cannot match the wrong
-                  # selector, the wrong rule, or both greps at once.
-                  tags=${rule%%\"scope_selectors\"*}
-                  scopes=${rule#*\"scope_selectors\"}
+                  # selector, the wrong rule, or both greps at once. The split
+                  # key keeps its colon so that a pattern whose value is
+                  # literally scope_selectors is not mistaken for the delimiter
+                  # (ending the key needs a ", which our values cannot contain
+                  # and Harbor escapes as \" inside strings).
+                  # Residual assumption: tag_selectors precedes scope_selectors
+                  # within a rule object - Go marshals struct fields in
+                  # declaration order, and that is their order in Harbor's
+                  # ImmutableRule struct.
+                  tags=${rule%%\"scope_selectors\":*}
+                  scopes=${rule#*\"scope_selectors\":}
                   printf '%s' "$tags" | grep -qF "\"pattern\":\"${tag_pattern}\"" || continue
                   printf '%s' "$scopes" | grep -qF "\"pattern\":\"${repo_pattern}\"" || continue
                   echo "project ${name}: immutable rule ${tag_pattern} on ${repo_pattern} already present"

@@ -31,8 +31,9 @@ Job, authenticating with the same admin Secret. It is idempotent — every proje
 rule is looked up before it is created — so a repeat `helm upgrade` makes no changes. For
 projects and members Harbor's own `409 Conflict` is a second line of defence; immutable tag
 rules have none (Harbor will insert an equivalent rule), so the Job compares each rule's
-`tag_selectors` and `scope_selectors` separately and refuses to continue if a project has more
-than 100 rules — Harbor's maximum page size — rather than risk a duplicate. It needs no
+`tag_selectors` and `scope_selectors` separately and refuses to continue rather than risk a
+duplicate — if `X-Total-Count` says a project has more members or rules than the single page it
+reads (100, Harbor's maximum page size), or if a rule cannot be parsed. It needs no
 Kubernetes API access, and so works on standalone installs (`nebariapp.enabled: false`) as
 well, running as the namespace `default` ServiceAccount.
 
