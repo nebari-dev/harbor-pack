@@ -85,14 +85,15 @@ Www-Authenticate: Bearer realm="https://harbor.harbor.svc.cluster.local/service/
 The **host** comes from the request, the **scheme** comes from `harbor.externalURL`. Harbor builds
 the realm in `tokenSvcURL` (`src/server/middleware/v2auth/auth.go`):
 
-1. If the request's `Host` matches Harbor's configured internal core URL (`CORE_URL`, which the
-   upstream chart sets to `http://<release>-harbor-core:80`), the realm is that internal URL
-   verbatim — plain HTTP.
+1. If the request's `Host` matches the host of Harbor's configured internal core URL (`CORE_URL`,
+   which the upstream chart sets to `http://<release>-harbor-core:80`; the comparison normalizes
+   default ports), the realm is that internal URL plus `/service/token` — plain HTTP.
 2. Otherwise Harbor takes the scheme from the configured external endpoint and glues it onto the
    request's own `Host`: `<scheme of externalURL>://<request Host>/service/token`. The bundled
    nginx passes the client's `Host` through unchanged on `/v2/`, so that is whatever hostname the
    consumer dialled.
-3. Only if the request carries no `Host` at all does Harbor fall back to the external endpoint.
+3. Only if the request carries no `Host` at all does Harbor fall back to the external endpoint
+   (again with `/service/token` appended).
 
 `harbor.externalURL` must be the public **HTTPS** hostname for the browser OIDC flow to work, so
 branch 2 hands an in-cluster consumer an `https://` realm on the in-cluster Service — which this
@@ -144,7 +145,7 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 
 :::note
 Send every manifest media type you can handle in `Accept`. A tag often points at an **index**
-(multi-arch manifest list) rather than a single image manifest, and a registry will refuse the
+(multi-arch manifest list) rather than a single image manifest, and a registry may refuse the
 request if the type it holds is not in your `Accept` header.
 :::
 
