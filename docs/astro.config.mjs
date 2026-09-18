@@ -32,6 +32,7 @@ export default defineConfig({
         // so it must point at the Astro project root inside the repo.
         baseUrl: 'https://github.com/nebari-dev/harbor-pack/edit/main/docs/',
       },
+      lastUpdated: true,
       sidebar: [
         {
           label: 'Getting Started',
@@ -41,6 +42,7 @@ export default defineConfig({
             { label: 'Local Development', link: '/local-development/' },
             { label: 'Authentication', link: '/authentication/' },
             { label: 'Registry Setup', link: '/registry-setup/' },
+            { label: 'In-Cluster Consumers', link: '/in-cluster-consumers/' },
             { label: 'Configuration', link: '/configuration/' },
           ],
         },
