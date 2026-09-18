@@ -45,6 +45,43 @@ jobs:
           # -ignore-missing-schemas: NebariApp CRD schema is not bundled.
           kubeconform -strict -ignore-missing-schemas -summary /tmp/nebari.yaml
 
+      - name: Template (GitOps stable secrets)
+        run: |
+          helm template harbor chart/ -f examples/gitops-values.yaml > /tmp/gitops-1.yaml
+          kubeconform -strict -ignore-missing-schemas -summary /tmp/gitops-1.yaml
+
+      - name: Render is deterministic with stableSecrets
+        run: |
+          # The regression this guards: the upstream Harbor chart mints the core,
+          # jobservice and registry secrets plus the token-signing key pair at
+          # RENDER time, so under a GitOps controller (which renders without
+          # cluster access) every sync re-keys four Secrets and rolls three
+          # Deployments. With stableSecrets configured nothing is generated at
+          # render time, so two runs of identical values must be byte-identical.
+          # Nothing is excluded from the comparison - the provisioning hook Job
+          # generates its material at RUN time, not at render time.
+          helm template harbor chart/ -f examples/gitops-values.yaml > /tmp/gitops-2.yaml
+          if ! cmp -s /tmp/gitops-1.yaml /tmp/gitops-2.yaml; then
+            diff -u /tmp/gitops-1.yaml /tmp/gitops-2.yaml || true
+            echo "::error::helm template is not deterministic with stableSecrets configured"
+            exit 1
+          fi
+          echo "Two renders with identical values are byte-identical."
+
+      - name: stableSecrets without the fan-out fails the render
+        run: |
+          # The seven upstream keys cannot be set from a parent template, so the
+          # chart must refuse to render a half-configured install rather than
+          # quietly keep generating credentials.
+          if helm template harbor chart/ \
+               --set stableSecrets.enabled=true \
+               --set harbor.harborAdminPassword=ci > /tmp/unguarded.yaml 2>/tmp/unguarded.err; then
+            echo "::error::expected the render to fail when stableSecrets.enabled is set without the harbor.* fan-out"
+            exit 1
+          fi
+          grep -q "existingSecretSecretKey" /tmp/unguarded.err
+          echo "Render failed as expected with the fan-out block in the message."
+
       - name: Validate pack-metadata.yaml
         run: |
           pip install check-jsonschema

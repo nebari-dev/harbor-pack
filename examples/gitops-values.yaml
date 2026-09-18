@@ -1,0 +1,65 @@
+# GitOps deployment: stable credentials, byte-identical renders.
+#
+# The upstream Harbor chart generates credentials at render time when they are
+# not supplied, and reuses in-cluster values via `lookup`. A GitOps controller
+# renders without cluster access, so `lookup` finds nothing and every sync draws
+# fresh values: four Secrets get re-keyed and core/jobservice/registry roll.
+# (Argo CD documents this as the "random data" failure mode.)
+#
+# This file keeps the credentials in two Secrets instead, so nothing is
+# generated at render time and two `helm template` runs are byte-identical -
+# which is exactly what CI checks.
+#
+#   harbor-internal        Opaque, 7 keys (secretKey, secret, CSRF_KEY,
+#                          JOBSERVICE_SECRET, REGISTRY_HTTP_SECRET,
+#                          REGISTRY_PASSWD, REGISTRY_HTPASSWD)
+#   harbor-token-signing   kubernetes.io/tls (tls.crt, tls.key)
+#   harbor-admin           Opaque, HARBOR_ADMIN_PASSWORD
+#
+# With `provision: true` the chart's PreSync hook Job creates whichever of these
+# do not exist yet, and never modifies one that does. Bring your own instead
+# (SealedSecret / ExternalSecret / kubectl) by setting `provision: false` - the
+# `harbor:` block below is unchanged either way.
+#
+#   helm install harbor ./chart -n harbor -f examples/gitops-values.yaml \
+#     --set harbor.externalURL=https://harbor.example.com
+#
+# NOTE: secretKey encrypts the robot-account and registry credentials stored in
+# Harbor's database. Back up harbor-internal together with the database; without
+# it those credentials cannot be decrypted.
+
+nebariapp:
+  enabled: false
+
+oidcSetup:
+  enabled: false
+
+stableSecrets:
+  enabled: true
+  provision: true
+  internalSecret: harbor-internal
+  tokenSigningSecret: harbor-token-signing
+  adminPassword:
+    enabled: true
+    secretName: harbor-admin
+    key: HARBOR_ADMIN_PASSWORD
+
+harbor:
+  externalURL: https://harbor.example.com
+
+  # The fan-out. Helm cannot set subchart values from a parent template, so
+  # these seven keys (plus the two admin-password keys) must be spelled out
+  # here; the chart fails the render if they do not match `stableSecrets`.
+  existingSecretSecretKey: harbor-internal
+  core:
+    existingSecret: harbor-internal
+    existingXsrfSecret: harbor-internal
+    secretName: harbor-token-signing
+  jobservice:
+    existingSecret: harbor-internal
+  registry:
+    existingSecret: harbor-internal
+    credentials:
+      existingSecret: harbor-internal
+  existingSecretAdminPassword: harbor-admin
+  existingSecretAdminPasswordKey: HARBOR_ADMIN_PASSWORD

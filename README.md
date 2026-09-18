@@ -155,6 +155,93 @@ and [`examples/nebari-values.yaml`](examples/nebari-values.yaml):
 - Database → `harbor.database.type: external` + `harbor.database.external.*`
 - Redis → `harbor.redis.type: external` + `harbor.redis.external.*`
 
+## Stable secrets (GitOps)
+
+The upstream Harbor chart mints credentials **at render time** when they are not supplied
+(`randAlphaNum` for the core/jobservice/registry secrets, `genCA` for the token-signing key
+pair, `htpasswd` for the registry credential), reusing what is already in the cluster via
+`lookup`. A GitOps controller renders *without* cluster access, so `lookup` finds nothing:
+every sync draws fresh values, re-keys four Secrets, and rolls `core`, `jobservice` and
+`registry`. This is Argo CD's documented
+[random-data](https://argo-cd.readthedocs.io/en/stable/user-guide/helm/#random-data) failure
+mode — two `helm template` runs of this chart differ in seven objects by default.
+
+`stableSecrets` moves those credentials into two Secrets that live in the cluster, so nothing
+is generated at render time and repeated renders are byte-identical (CI checks exactly that):
+
+```yaml
+stableSecrets:
+  enabled: true
+  provision: true                           # create the Secrets if they are missing
+  internalSecret: harbor-internal
+  tokenSigningSecret: harbor-token-signing
+  adminPassword:
+    enabled: true                           # optional: generate the admin password too
+    secretName: harbor-admin
+```
+
+Helm cannot write a subchart's values from a parent template, so enabling this does **not**
+rewrite the `harbor:` values for you — the seven upstream keys must be set alongside it.
+[`examples/gitops-values.yaml`](examples/gitops-values.yaml) is the ready-made file; the chart
+fails the render with the exact block to paste if any key is missing or mismatched.
+
+### What the Secrets hold
+
+| Secret | Type | Keys | Protects |
+|---|---|---|---|
+| `harbor-internal` | `Opaque` | `secretKey` (16 chars) | **Encrypts robot-account and registry credentials stored in Harbor's database.** Back it up *with* the database — without it those credentials are unrecoverable. |
+| | | `secret` (16) | `core` ↔ component shared secret. |
+| | | `CSRF_KEY` (32 exactly) | Portal CSRF tokens; `harbor-core` validates the length. |
+| | | `JOBSERVICE_SECRET` (16) | `jobservice` API authentication. |
+| | | `REGISTRY_HTTP_SECRET` (16) | Registry upload-state HMAC; must be identical across registry replicas. |
+| | | `REGISTRY_PASSWD` | Plaintext password `core`/`jobservice` send to the registry. |
+| | | `REGISTRY_HTPASSWD` | `<username>:<bcrypt hash of REGISTRY_PASSWD>`. Username defaults to `harbor_registry_user` (`harbor.registry.credentials.username`). bcrypt only. |
+| `harbor-token-signing` | `kubernetes.io/tls` | `tls.crt`, `tls.key` | Signs the JWTs the registry accepts for pull/push. The key must be PKCS#1 (`BEGIN RSA PRIVATE KEY`) — Harbor's libtrust rejects PKCS#8. |
+| `harbor-admin` | `Opaque` | `HARBOR_ADMIN_PASSWORD` | Harbor's built-in `admin` account (optional; also read by the OIDC-setup Job). |
+
+### Provisioning
+
+With `provision: true` a **pre-install/pre-upgrade** hook Job (annotated
+`argocd.argoproj.io/hook: PreSync`, since the pods mount these Secrets at startup) creates
+whichever Secrets are absent and leaves existing ones alone — its Role grants only `get` and
+`create` on Secrets, so overwriting is impossible by construction, not by convention. Values
+are never logged. It runs under its own ServiceAccount/Role/RoleBinding, rendered as hooks at
+a lower weight, and does not depend on `nebariapp`.
+
+Set `provision: false` to bring your own Secrets instead (SealedSecrets, ExternalSecrets, or
+`kubectl create secret`); the `harbor:` block is identical either way.
+
+The Job uses three small, pinned, stock images because no single stock image ships all three
+tools it needs and the containers run with a read-only root filesystem (so packages cannot be
+installed at runtime): `httpd:2.4-alpine` for bcrypt `htpasswd`, `alpine/openssl` for the key
+pair, and `curlimages/curl` to create the Secrets through the Kubernetes API. Override them
+under `stableSecrets.images` to pull from a mirror.
+
+### Rotating a credential
+
+There is no in-place rotation: recreate the Secret and restart whatever mounts it.
+
+```sh
+# Example: rotate the jobservice secret.
+kubectl -n harbor get secret harbor-internal -o yaml > /tmp/harbor-internal.bak.yaml
+kubectl -n harbor patch secret harbor-internal \
+  -p "{\"stringData\":{\"JOBSERVICE_SECRET\":\"$(head -c 12 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9' | head -c 16)\"}}"
+kubectl -n harbor rollout restart deploy/harbor-core deploy/harbor-jobservice deploy/harbor-registry
+```
+
+Notes per key:
+
+- `secretKey` — **do not rotate casually.** Robot-account and registry credentials already in
+  the database are encrypted with it and become unreadable if it changes.
+- `REGISTRY_PASSWD` — must be rotated together with `REGISTRY_HTPASSWD` (the bcrypt hash of
+  the new password, `htpasswd -nbB -C 10 harbor_registry_user <new>`), or the registry will
+  reject `core` and `jobservice`.
+- `tls.crt`/`tls.key` — replacing them invalidates every issued pull/push token; in-flight
+  `docker pull`s fail until clients re-authenticate. The provisioned certificate is valid for
+  `stableSecrets.tokenCertDays` (default 3650) precisely so this is a deliberate act.
+- Deleting a Secret entirely and re-running the hook (`helm upgrade`, or an Argo CD sync)
+  regenerates it — the same rotation, with the same restart requirement.
+
 ## Values reference (pack-specific)
 
 | Key | Default | Description |
@@ -170,6 +257,13 @@ and [`examples/nebari-values.yaml`](examples/nebari-values.yaml):
 | `oidcSetup.enabled` | `true` | Run the Job that switches Harbor to `oidc_auth`. |
 | `oidcSetup.adminGroup` | `""` | Keycloak group mapped to Harbor system-admin. |
 | `oidcSetup.autoOnboard` | `true` | Auto-create Harbor users on first OIDC login. |
+| `stableSecrets.enabled` | `false` | Use pre-created Secrets instead of render-time generation (see [Stable secrets](#stable-secrets-gitops)). |
+| `stableSecrets.provision` | `true` | Run the PreSync hook Job that creates missing Secrets. |
+| `stableSecrets.internalSecret` | `harbor-internal` | Opaque Secret holding the seven internal credentials. |
+| `stableSecrets.tokenSigningSecret` | `harbor-token-signing` | `kubernetes.io/tls` Secret signing registry tokens. |
+| `stableSecrets.tokenCertDays` | `3650` | Lifetime of the provisioned token-signing certificate. |
+| `stableSecrets.adminPassword.enabled` | `false` | Also generate the Harbor admin password Secret when absent. |
+| `stableSecrets.images.*` | pinned | Images for the provisioning Job (`htpasswd`, `openssl`, `apiClient`). |
 | `harbor.*` | — | Passed to the upstream Harbor chart. |
 
 ## Troubleshooting
@@ -184,6 +278,14 @@ and [`examples/nebari-values.yaml`](examples/nebari-values.yaml):
   `GET /api/v2.0/configurations` shows `auth_mode=oidc_auth`.
 - **`docker login` fails** — use a **CLI secret** or robot account, not your Keycloak
   password (OIDC users cannot use their IdP password for the registry).
+- **Render fails with "stableSecrets.enabled is true, but …"** — the seven `harbor.*` keys are
+  missing or point somewhere else; paste the block from the error message, or use
+  [`examples/gitops-values.yaml`](examples/gitops-values.yaml).
+- **Stable-secrets Job failing** — `kubectl logs job/<release>-harbor-pack-stable-secrets -n <ns>`.
+  It only ever prints Secret names and HTTP status codes. A `403` means the hook's Role/
+  RoleBinding did not land first (they are hooks at a lower weight/sync-wave).
+- **Pods stuck in `CreateContainerConfigError` after enabling `stableSecrets`** — the named
+  Secrets do not exist and `provision` is `false`; create them or turn provisioning on.
 - **Keycloak `redirect_uri` error** — ensure `nebariapp.auth.redirectURI` is
   `/c/oidc/callback` and `harbor.externalURL` matches `https://<hostname>`.
 
