@@ -31,20 +31,33 @@ HARBOR_HOSTNAME=${HARBOR_HOSTNAME:-harbor.nebari.local}
 SEED_USER=${SEED_USER:-dev}
 HARBOR_PROJECT=${HARBOR_PROJECT:-dev}
 
+cleanup() {
+  if [ -n "${PF_PID:-}" ]; then kill "$PF_PID" 2>/dev/null || true; fi
+  rm -f "${BODY:-}" "${PF_LOG:-}" "${CURL_CFG:-}"
+}
+# Install the trap before allocating anything so INT/TERM/failure can't orphan
+# the temp files or the port-forward.
+trap cleanup EXIT
+trap 'cleanup; trap - INT; kill -INT $$' INT
+trap 'cleanup; trap - TERM; kill -TERM $$' TERM
+
 BODY=$(mktemp)
 PF_LOG=$(mktemp)
 CURL_CFG=$(mktemp)
 
-cleanup() {
-  if [ -n "${PF_PID:-}" ]; then kill "$PF_PID" 2>/dev/null || true; fi
-  rm -f "$BODY" "$PF_LOG" "$CURL_CFG"
-}
-trap cleanup EXIT
-
 # Hand the admin credential to curl through a 0600 config file instead of `-u` on the
 # command line, so it does not sit in `ps` output for the life of each request.
+# curl config values are double-quoted with backslash/quote escaping so whitespace
+# survives and an embedded newline can't inject config options. A literal newline in
+# the credential still can't be represented — refuse it.
+nl=$(printf '\nx'); nl=${nl%x}
+case "$HARBOR_ADMIN$HARBOR_ADMIN_PASSWORD" in
+  *"$nl"*) echo "error: newline in Harbor admin credential is not supported" >&2; exit 1 ;;
+esac
 chmod 600 "$CURL_CFG"
-printf 'user = %s:%s\n' "$HARBOR_ADMIN" "$HARBOR_ADMIN_PASSWORD" > "$CURL_CFG"
+esc_admin=$(printf '%s' "$HARBOR_ADMIN" | sed 's/[\\"]/\\&/g')
+esc_pw=$(printf '%s' "$HARBOR_ADMIN_PASSWORD" | sed 's/[\\"]/\\&/g')
+printf 'user = "%s:%s"\n' "$esc_admin" "$esc_pw" > "$CURL_CFG"
 
 # api <METHOD> <PATH> [JSON] -> prints the HTTP status, writes the response body to $BODY
 api() {
