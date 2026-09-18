@@ -133,9 +133,12 @@ Registry host recorded in the robot Secrets: the host[:port] part of
 harbor.externalURL, with the scheme and any path stripped, so a consumer can
 build a docker-style auth entry without a second lookup.
 
-Falls back to the in-cluster Harbor front Service (host:port) when
-harbor.externalURL is unset - usable only from inside the cluster and only over
-plain HTTP, so the robots Job prints a warning in that case.
+Falls back to the in-cluster Harbor front Service when harbor.externalURL is
+unset - usable only from inside the cluster and only over plain HTTP, so the
+robots Job prints a warning in that case. The fallback is fully qualified
+(<service>.<namespace>.svc:<port>) because a consumer reading the Secret may
+well run in a different namespace, where the bare Service name would not
+resolve - or worse, would resolve to something else.
 */}}
 {{- define "harbor-pack.registry-host" -}}
 {{- $ext := .Values.harbor.externalURL | default "" -}}
@@ -143,7 +146,7 @@ plain HTTP, so the robots Job prints a warning in that case.
 {{- $hostPath := regexReplaceAll "^[A-Za-z][A-Za-z0-9+.-]*://" $ext "" -}}
 {{- (splitList "/" $hostPath) | first -}}
 {{- else -}}
-{{- printf "%s:%s" (include "harbor-pack.harbor-service-name" .) (include "harbor-pack.harbor-service-port" .) -}}
+{{- printf "%s.%s.svc:%s" (include "harbor-pack.harbor-service-name" .) .Release.Namespace (include "harbor-pack.harbor-service-port" .) -}}
 {{- end -}}
 {{- end }}
 

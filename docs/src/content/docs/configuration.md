@@ -81,29 +81,49 @@ lookup:
 | `password` | The robot secret |
 | `registry` | The host of `harbor.externalURL`, e.g. `harbor.nebari.example.com` |
 
+Each Secret also carries a `harbor-pack.nebari.dev/robot-id` annotation recording which Harbor
+robot the credential belongs to.
+
 :::caution Always set `duration`
 Harbor's instance default `robot_token_duration` is 30 days. A robot created without an
 explicit duration expires silently and the consumer starts getting `401`s a month later. `-1`
-means never.
+means never; `0` and fractional values are rejected at render time so they cannot quietly fall
+back to that default.
 :::
 
 The Job (`<release>-harbor-pack-bootstrap-robots`) runs at hook weight `11`, after the projects
-Job, so a project-level robot's project already exists. It is idempotent:
+Job, so a project-level robot's project already exists. It is idempotent, and decides what to
+do by comparing the Secret's `robot-id` annotation against the robot it finds in Harbor:
 
 | State found | Action |
 |---|---|
-| Robot exists **and** its Secret exists | Nothing — a repeat `helm upgrade` is a no-op |
-| Robot exists, Secret missing | `PATCH /robots/{id}` to mint a fresh secret, then write the Secret |
+| Robot exists, Secret exists, ids agree | Nothing — a repeat `helm upgrade` is a no-op |
+| Robot exists, Secret exists, ids differ (or no annotation) | `PATCH /robots/{id}` to mint a fresh secret, then rewrite the Secret |
+| Robot exists, Secret missing | `PATCH /robots/{id}`, then write the Secret |
 | Robot missing | `POST /robots`, then write the Secret |
+
+Comparing ids rather than just "does a Secret exist" is what makes the Job crash-safe. If it
+dies between creating the robot and writing the Secret, the next run sees the mismatch and
+rotates instead of leaving a dead credential published forever. A Secret written before this
+annotation existed gets exactly one rotation and is verifiable from then on.
 
 An existing Secret is only overwritten when the robot behind it was created or rotated in the
 same run, so deleting the Secret and re-running restores it with a freshly rotated credential.
-Rotating the wrong robot would break whatever was using it, so the lookup is an exact-name
-query cross-checked against `X-Total-Count`: an ambiguous or truncated result fails the Job.
+Two robots may not target the same Secret — `helm template` fails if they do, rather than
+letting them overwrite each other on every run.
 
-The secret is never logged: the script never runs under `set -x`, never passes the secret as a
-command-line argument, and prints only names, ids and API error messages — never a response
-body, since robot and Secret payloads carry secret material.
+Rotating the wrong robot would break whatever was using it, so the lookup is deliberately
+strict. Project robots are listed by project id — `GET /robots` without a level silently means
+*system* robots only, and the name cannot be filtered server-side because Harbor unescapes the
+query string a second time, turning the `+` in `<project>+<name>` into a space — and matched
+exactly on the stored name locally. System robots are filtered by exact name server-side. More
+than one match, or a listing larger than one page, stops the Job.
+
+The secret is never logged: the script never runs under `set -x`, never passes the secret (or
+the ServiceAccount token, which goes to `curl` in a `0600` config file) as a command-line
+argument, and prints only names, ids and API error messages — never a response body, since
+robot and Secret payloads carry secret material. Response files are written under `umask 077`
+and removed by an `EXIT` trap, so a mid-run failure leaves no credential behind in the pod.
 
 Unlike the projects Job, this one must write to the Kubernetes API, so it runs as a dedicated
 ServiceAccount whose Role grants `create` on Secrets plus `get`/`update` restricted to exactly
@@ -216,7 +236,7 @@ harbor:
 | `bootstrap.robots[].name` | — | Required; lower-case robot name. Harbor prefixes it (`robot$<project>+<name>`). |
 | `bootstrap.robots[].level` | `project` | `project` or `system`. |
 | `bootstrap.robots[].project` | `""` | Required for `level: project`; for `level: system` it scopes permissions to one project instead of all (`*`). |
-| `bootstrap.robots[].duration` | `-1` | Days until expiry; `-1` = never. Do not rely on Harbor's 30-day instance default. |
+| `bootstrap.robots[].duration` | `-1` | Whole days until expiry; `-1` = never. `0` and fractional values are rejected — do not rely on Harbor's 30-day instance default. |
 | `bootstrap.robots[].permissions` | `[]` | `[]` = pull-only; otherwise explicit project-scope `{resource, action}` pairs. |
 | `bootstrap.robots[].secret.name` | — | Required; name of the Kubernetes Secret to write. |
 | `bootstrap.robots[].secret.namespace` | `""` | Defaults to the release namespace; another namespace also renders a Role/RoleBinding there. |
