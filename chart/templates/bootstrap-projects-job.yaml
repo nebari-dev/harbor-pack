@@ -246,6 +246,13 @@ spec:
                   scopes=${rule#*\"scope_selectors\":}
                   printf '%s' "$tags" | grep -qF "\"pattern\":\"${tag_pattern}\"" || continue
                   printf '%s' "$scopes" | grep -qF "\"pattern\":\"${repo_pattern}\"" || continue
+                  # A rule only counts as "already present" if it is the rule we
+                  # would create: enabled, with matches/repoMatches decorations.
+                  # A disabled or excludes/repoExcludes rule with the same
+                  # patterns does NOT protect these tags, so we still create.
+                  printf '%s' "$rule" | grep -qF '"disabled":false' || continue
+                  printf '%s' "$tags" | grep -qF '"decoration":"matches"' || continue
+                  printf '%s' "$scopes" | grep -qF '"decoration":"repoMatches"' || continue
                   echo "project ${name}: immutable rule ${tag_pattern} on ${repo_pattern} already present"
                   return 0
                 done < /tmp/rules.txt
