@@ -87,14 +87,40 @@ name is fixed as "harbor".
 {{- end }}
 
 {{/*
-Secret holding the Harbor admin password. The upstream chart writes it to the
-core Secret (<harbor-fullname>-core) under key HARBOR_ADMIN_PASSWORD.
+Secret holding the Harbor admin password, for the OIDC-setup Job to read.
+
+The upstream chart writes the password into its core Secret
+(<harbor-fullname>-core, key HARBOR_ADMIN_PASSWORD) - but ONLY while
+harbor.existingSecretAdminPassword is unset. Once it is set (as stableSecrets'
+optional admin-password provisioning requires) upstream omits the key entirely,
+so defaulting to the core Secret would leave the Job in
+CreateContainerConfigError. Follow harbor.existingSecretAdminPassword when it is
+set; an explicit oidcSetup.adminPasswordSecret still wins over both.
 */}}
 {{- define "harbor-pack.admin-secret-name" -}}
+{{- $harborAdminSecret := dig "existingSecretAdminPassword" "" (.Values.harbor | default dict) -}}
 {{- if .Values.oidcSetup.adminPasswordSecret }}
 {{- .Values.oidcSetup.adminPasswordSecret }}
+{{- else if $harborAdminSecret }}
+{{- $harborAdminSecret }}
 {{- else }}
 {{- printf "%s-core" (include "harbor-pack.harbor-fullname" .) }}
+{{- end }}
+{{- end }}
+
+{{/*
+Key within the Secret above. Mirrors the name resolution: when the name comes
+from harbor.existingSecretAdminPassword, the key must come from its companion
+harbor.existingSecretAdminPasswordKey (upstream default HARBOR_ADMIN_PASSWORD).
+*/}}
+{{- define "harbor-pack.admin-secret-key" -}}
+{{- $harborAdminSecret := dig "existingSecretAdminPassword" "" (.Values.harbor | default dict) -}}
+{{- if .Values.oidcSetup.adminPasswordSecret }}
+{{- .Values.oidcSetup.adminPasswordKey }}
+{{- else if $harborAdminSecret }}
+{{- dig "existingSecretAdminPasswordKey" "HARBOR_ADMIN_PASSWORD" (.Values.harbor | default dict) | default "HARBOR_ADMIN_PASSWORD" }}
+{{- else }}
+{{- .Values.oidcSetup.adminPasswordKey }}
 {{- end }}
 {{- end }}
 
@@ -176,6 +202,22 @@ do not point at the two Secret names. Renders nothing on success.
   {{- $got := index $actual $key | toString -}}
   {{- if ne $got $want -}}
     {{- $wrong = append $wrong (printf "  harbor.%s = %q (expected %q)" $key $got $want) -}}
+  {{- end -}}
+{{- end -}}
+{{/*
+  Three of upstream's existing-Secret options let you rename the key they read
+  inside the Secret. The provisioning Job writes the default names, so a renamed
+  selector would point the pods at a key that is not there. Require the defaults.
+*/}}
+{{- $keySelectors := dict
+      "core.existingXsrfSecretKey" (list (dig "core" "existingXsrfSecretKey" "" $h | toString) "CSRF_KEY")
+      "jobservice.existingSecretKey" (list (dig "jobservice" "existingSecretKey" "" $h | toString) "JOBSERVICE_SECRET")
+      "registry.existingSecretKey" (list (dig "registry" "existingSecretKey" "" $h | toString) "REGISTRY_HTTP_SECRET") -}}
+{{- range $key, $pair := $keySelectors -}}
+  {{- $got := index $pair 0 -}}
+  {{- $want := index $pair 1 -}}
+  {{- if ne $got $want -}}
+    {{- $wrong = append $wrong (printf "  harbor.%s = %q (must be %q - the Secret is written with the default key names)" $key $got $want) -}}
   {{- end -}}
 {{- end -}}
 {{- $block := printf "harbor:\n  existingSecretSecretKey: %s\n  core:\n    existingSecret: %s\n    existingXsrfSecret: %s\n    secretName: %s\n  jobservice:\n    existingSecret: %s\n  registry:\n    existingSecret: %s\n    credentials:\n      existingSecret: %s" $internal $internal $internal $tokenSigning $internal $internal $internal -}}

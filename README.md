@@ -197,7 +197,16 @@ fails the render with the exact block to paste if any key is missing or mismatch
 | | | `REGISTRY_PASSWD` | Plaintext password `core`/`jobservice` send to the registry. |
 | | | `REGISTRY_HTPASSWD` | `<username>:<bcrypt hash of REGISTRY_PASSWD>`. Username defaults to `harbor_registry_user` (`harbor.registry.credentials.username`). bcrypt only. |
 | `harbor-token-signing` | `kubernetes.io/tls` | `tls.crt`, `tls.key` | Signs the JWTs the registry accepts for pull/push. The key must be PKCS#1 (`BEGIN RSA PRIVATE KEY`) — Harbor's libtrust rejects PKCS#8. |
-| `harbor-admin` | `Opaque` | `HARBOR_ADMIN_PASSWORD` | Harbor's built-in `admin` account (optional; also read by the OIDC-setup Job). |
+| `harbor-admin` | `Opaque` | `HARBOR_ADMIN_PASSWORD` | Harbor's built-in `admin` account (optional). |
+
+Key names are fixed: the Job writes the defaults above, so `harbor.core.existingXsrfSecretKey`,
+`harbor.jobservice.existingSecretKey` and `harbor.registry.existingSecretKey` must keep their
+upstream defaults (`CSRF_KEY`, `JOBSERVICE_SECRET`, `REGISTRY_HTTP_SECRET`). The chart fails
+the render if they are renamed, rather than letting the pods reference a key that is not there.
+
+When `adminPassword.enabled` is set, `harbor.existingSecretAdminPassword` points Harbor at
+`harbor-admin` and upstream then *omits* the password from its core Secret — so the OIDC-setup
+Job follows it automatically (`oidcSetup.adminPasswordSecret` still overrides).
 
 ### Provisioning
 
@@ -216,6 +225,59 @@ tools it needs and the containers run with a read-only root filesystem (so packa
 installed at runtime): `httpd:2.4-alpine` for bcrypt `htpasswd`, `alpine/openssl` for the key
 pair, and `curlimages/curl` to create the Secrets through the Kubernetes API. Override them
 under `stableSecrets.images` to pull from a mirror.
+
+### Migrating an existing install
+
+**Do not just switch `stableSecrets.enabled` on over a running Harbor.** As soon as
+`harbor.existingSecretSecretKey` is set, upstream stops writing `secretKey` into its core
+Secret; a freshly generated one would replace the key that encrypts the robot-account and
+registry credentials already in Harbor's database, and they become undecryptable. The
+provisioning Job detects this (core Secret still carries a chart-generated `secretKey`, the
+internal Secret does not exist) and **refuses to run**.
+
+Copy the existing material across first. With the default release name `harbor`, upstream's
+Secrets are `harbor-core`, `harbor-jobservice`, `harbor-registry` and
+`harbor-registry-htpasswd` (otherwise `<release>-harbor-*`):
+
+```sh
+NS=harbor
+CORE=harbor-core
+JOBSVC=harbor-jobservice
+REG=harbor-registry
+HTPASSWD=harbor-registry-htpasswd
+
+get() { kubectl -n "$NS" get secret "$1" -o "jsonpath={.data.$2}" | base64 -d; }
+
+kubectl -n "$NS" create secret generic harbor-internal \
+  --from-literal=secretKey="$(get $CORE secretKey)" \
+  --from-literal=secret="$(get $CORE secret)" \
+  --from-literal=CSRF_KEY="$(get $CORE CSRF_KEY)" \
+  --from-literal=JOBSERVICE_SECRET="$(get $JOBSVC JOBSERVICE_SECRET)" \
+  --from-literal=REGISTRY_HTTP_SECRET="$(get $REG REGISTRY_HTTP_SECRET)" \
+  --from-literal=REGISTRY_PASSWD="$(get $CORE REGISTRY_CREDENTIAL_PASSWORD)" \
+  --from-literal=REGISTRY_HTPASSWD="$(get $HTPASSWD REGISTRY_HTPASSWD)"
+
+# The token-signing key pair lives in the same core Secret (keys tls.crt/tls.key).
+umask 077
+get $CORE 'tls\.crt' > /tmp/harbor-token.crt
+get $CORE 'tls\.key' > /tmp/harbor-token.key
+kubectl -n "$NS" create secret tls harbor-token-signing \
+  --cert=/tmp/harbor-token.crt --key=/tmp/harbor-token.key
+rm -f /tmp/harbor-token.crt /tmp/harbor-token.key
+
+# Only if you also want stableSecrets.adminPassword.enabled and the password is
+# still in the core Secret (i.e. harbor.existingSecretAdminPassword was unset):
+kubectl -n "$NS" create secret generic harbor-admin \
+  --from-literal=HARBOR_ADMIN_PASSWORD="$(get $CORE HARBOR_ADMIN_PASSWORD)"
+```
+
+Then enable `stableSecrets` together with the `harbor:` fan-out and upgrade. The Job sees the
+Secrets already exist, leaves them untouched, and the credentials never change — which is the
+whole point.
+
+`stableSecrets.allowFreshOnExisting: true` overrides the refusal and generates fresh
+credentials instead. Use it only on an install whose stored credentials you are willing to
+lose (a dev cluster, or a Harbor with no robot accounts and no replication endpoints yet).
 
 ### Rotating a credential
 
@@ -259,6 +321,7 @@ Notes per key:
 | `oidcSetup.autoOnboard` | `true` | Auto-create Harbor users on first OIDC login. |
 | `stableSecrets.enabled` | `false` | Use pre-created Secrets instead of render-time generation (see [Stable secrets](#stable-secrets-gitops)). |
 | `stableSecrets.provision` | `true` | Run the PreSync hook Job that creates missing Secrets. |
+| `stableSecrets.allowFreshOnExisting` | `false` | Override the refusal to re-key an existing install (destroys stored credentials). |
 | `stableSecrets.internalSecret` | `harbor-internal` | Opaque Secret holding the seven internal credentials. |
 | `stableSecrets.tokenSigningSecret` | `harbor-token-signing` | `kubernetes.io/tls` Secret signing registry tokens. |
 | `stableSecrets.tokenCertDays` | `3650` | Lifetime of the provisioned token-signing certificate. |
@@ -281,9 +344,13 @@ Notes per key:
 - **Render fails with "stableSecrets.enabled is true, but …"** — the seven `harbor.*` keys are
   missing or point somewhere else; paste the block from the error message, or use
   [`examples/gitops-values.yaml`](examples/gitops-values.yaml).
-- **Stable-secrets Job failing** — `kubectl logs job/<release>-harbor-pack-stable-secrets -n <ns>`.
-  It only ever prints Secret names and HTTP status codes. A `403` means the hook's Role/
-  RoleBinding did not land first (they are hooks at a lower weight/sync-wave).
+- **Stable-secrets Job failing** — `kubectl logs job/<release>-harbor-pack-stable-secrets -n <ns>`
+  (add `-c preflight` / `-c generate-material` / `-c generate-token-cert` for the init
+  containers). It only ever prints Secret names and HTTP status codes. A `403` means the
+  hook's Role/RoleBinding did not land first (they are hooks at a lower weight/sync-wave).
+- **"REFUSING to generate new credentials"** — you enabled `stableSecrets` on an install that
+  already has chart-generated credentials; follow
+  [Migrating an existing install](#migrating-an-existing-install).
 - **Pods stuck in `CreateContainerConfigError` after enabling `stableSecrets`** — the named
   Secrets do not exist and `provision` is `false`; create them or turn provisioning on.
 - **Keycloak `redirect_uri` error** — ensure `nebariapp.auth.redirectURI` is

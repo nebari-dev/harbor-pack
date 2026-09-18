@@ -82,6 +82,20 @@ jobs:
           grep -q "existingSecretSecretKey" /tmp/unguarded.err
           echo "Render failed as expected with the fan-out block in the message."
 
+      - name: stableSecrets with a renamed key selector fails the render
+        run: |
+          # The provisioning Job writes the default key names, so renaming one of
+          # upstream's key selectors would point the pods at a key that is not in
+          # the Secret.
+          if helm template harbor chart/ -f examples/gitops-values.yaml \
+               --set harbor.jobservice.existingSecretKey=RENAMED \
+               > /dev/null 2>/tmp/renamed.err; then
+            echo "::error::expected the render to fail when a key selector is renamed"
+            exit 1
+          fi
+          grep -q "JOBSERVICE_SECRET" /tmp/renamed.err
+          echo "Render failed as expected."
+
       - name: Validate pack-metadata.yaml
         run: |
           pip install check-jsonschema

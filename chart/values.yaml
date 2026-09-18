@@ -76,10 +76,11 @@ oidcSetup:
   userClaim: preferred_username
   autoOnboard: true
   verifyCert: true
-  # Harbor admin credentials. The upstream chart writes them to the core Secret;
-  # leave these empty to read from that Secret (name/key computed by default), or
-  # override to point at your own Secret.
-  adminPasswordSecret: ""   # Defaults to "<harbor-fullname>-core".
+  # Harbor admin credentials. Leave empty to resolve automatically: the Secret
+  # named by harbor.existingSecretAdminPassword when that is set (upstream then
+  # omits the password from its core Secret), otherwise "<harbor-fullname>-core".
+  # Set these to point the Job at a Secret of your own instead.
+  adminPasswordSecret: ""
   adminPasswordKey: HARBOR_ADMIN_PASSWORD
 
 # =============================================================================
@@ -126,6 +127,16 @@ stableSecrets:
   # the Job's Role grants only get + create, no update. Set false if you supply
   # the Secrets yourself (SealedSecrets, ExternalSecrets, a manual kubectl).
   provision: true
+  # DANGER FLAG. Enabling stableSecrets over a RUNNING install is a data-loss
+  # trap: upstream drops secretKey from its core Secret the moment
+  # existingSecretSecretKey is set, so a freshly generated key replaces the one
+  # that encrypts the robot-account and registry credentials already in Harbor's
+  # database - and they become undecryptable. The provisioning Job detects that
+  # transition (core Secret still carries a chart-generated secretKey, internal
+  # Secret absent) and refuses. Migrate the existing material instead: see
+  # "Migrating an existing install" in the README. Set this true only on an
+  # install whose data you are willing to lose.
+  allowFreshOnExisting: false
   internalSecret: harbor-internal
   tokenSigningSecret: harbor-token-signing
   # Lifetime of the generated token-signing certificate. Long on purpose: the

@@ -27,6 +27,11 @@
 # NOTE: secretKey encrypts the robot-account and registry credentials stored in
 # Harbor's database. Back up harbor-internal together with the database; without
 # it those credentials cannot be decrypted.
+#
+# NOTE: this is for a NEW install. Turning stableSecrets on over a running
+# Harbor replaces that key and makes the stored credentials undecryptable - the
+# hook Job detects the transition and refuses. Copy the existing material across
+# first: see "Migrating an existing install" in the README.
 
 nebariapp:
   enabled: false
