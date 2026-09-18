@@ -166,14 +166,22 @@ bootstrap:
 ```
 
 The `harbor-harbor-pack-bootstrap-projects` Job runs after the OIDC Job (hook weight `10` vs
-`5`) using the same admin Secret, and is idempotent: it checks before every create and accepts
-`409 Conflict`, so repeat `helm upgrade`s make no changes and add no duplicate members or
-rules. It also works with `nebariapp.enabled: false` (standalone installs need projects too),
-where it runs as the namespace `default` ServiceAccount — the Job talks only to Harbor's API
-and needs no Kubernetes permissions.
+`5`) using the same admin Secret, and is idempotent: it looks each item up before creating it,
+so repeat `helm upgrade`s make no changes. Duplicate projects and members are impossible
+(Harbor answers `409 Conflict` if the lookup ever misses); immutable tag rules have no such
+server-side guard — Harbor inserts an equivalent rule without comparing selectors — so the Job
+matches the tag pattern against the rule's `tag_selectors` and the repo pattern against its
+`scope_selectors`, and fails loudly rather than guessing if a project has more than 100 rules
+(Harbor's maximum page size).
+
+It also works with `nebariapp.enabled: false` (standalone installs need projects too), where it
+runs as the namespace `default` ServiceAccount — the Job talks only to Harbor's API and needs
+no Kubernetes permissions.
 
 Group members map **OIDC groups** (`group_type: 3`), so they take effect once SSO is
-configured; Keycloak group members get the role on their next login.
+configured; Keycloak group members get the role on their next login. Names, groups and
+patterns are rendered into the Job's script as quoted literals; `helm template` fails if one
+contains a double quote, backslash or control character.
 
 ## Storage & backing services
 

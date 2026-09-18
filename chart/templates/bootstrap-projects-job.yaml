@@ -17,12 +17,18 @@
   standalone installs where no pack SA is rendered.
 
   Idempotency (the image has curl + busybox, no jq): existence is checked
-  before every create, and a 409 Conflict from Harbor is accepted as "already
-  there", so a repeated `helm upgrade` is a no-op.
+  before every create, so a repeated `helm upgrade` is a no-op. For projects
+  and members a 409 Conflict from Harbor is a second line of defence; for
+  immutable tag rules there is none - Harbor inserts an equivalent rule without
+  comparing selectors - so that lookup is exact and gives up loudly rather than
+  guessing (see ensure_immutable_rule).
 
   Shell safety: values are rendered as single-quoted /bin/sh literals by
-  `harbor-pack.sh-literal`, which also rejects quotes/backslashes that would
-  corrupt the hand-assembled JSON payloads.
+  `harbor-pack.sh-literal`, which rejects quotes/backslashes/control characters
+  that would corrupt the hand-assembled JSON payloads or this YAML block, and
+  doubles "$" so the kubelet's $(VAR) expansion - which happens before /bin/sh
+  ever sees the script, and has the admin password in scope - cannot be reached
+  from values.
 */}}
 {{- if .Values.bootstrap.enabled }}
 {{- $roleIDs := dict "projectAdmin" 1 "developer" 2 "guest" 3 "maintainer" 4 "limitedGuest" 5 }}
@@ -127,14 +133,21 @@ spec:
                 name="$1"
                 group="$2"
                 role_id="$3"
-                # Look the group up first so re-runs stay quiet. Harbor emits
-                # compact JSON, so a fixed-string grep for the exact
-                # "entity_name":"<group>" pair avoids substring false matches;
-                # if it ever misses, the 409 below still keeps this idempotent.
+                # Look the group up first so re-runs stay quiet. The entityname
+                # filter is fuzzy and returns USERS as well as groups, so split
+                # the (flat) member objects one per line and require the same
+                # line to carry both the exact entity_name and entity_type "g" -
+                # otherwise a user who happens to share the group's name would
+                # silently suppress the group grant. Harbor emits compact JSON,
+                # hence the fixed-string greps. If this ever misses, the 409
+                # below still keeps the Job idempotent.
                 if curl -s -G -u "$AUTH" -H "$NAME_HDR" \
                      --data-urlencode "entityname=${group}" \
+                     --data-urlencode "page_size=100" \
                      "${HARBOR_API}/projects/${name}/members" \
-                   | grep -qF "\"entity_name\":\"${group}\""; then
+                   | sed 's/},{/}\n{/g' \
+                   | grep -F "\"entity_name\":\"${group}\"" \
+                   | grep -qF '"entity_type":"g"'; then
                   echo "project ${name}: group ${group} is already a member"
                   return 0
                 fi
@@ -162,19 +175,43 @@ spec:
                 name="$1"
                 tag_pattern="$2"
                 repo_pattern="$3"
-                # Split the returned JSON array so each rule is on its own line
-                # ("id" only ever opens a rule object), then require both
-                # patterns on the SAME line - that keeps the grep from pairing
-                # the tag pattern of one rule with the repo pattern of another.
-                existing=$(curl -s -u "$AUTH" -H "$NAME_HDR" \
-                  "${HARBOR_API}/projects/${name}/immutabletagrules" \
-                  | sed 's/{"id":/\n{"id":/g')
-                if printf '%s\n' "$existing" \
-                     | grep -F "\"pattern\":\"${tag_pattern}\"" \
-                     | grep -qF "\"pattern\":\"${repo_pattern}\""; then
+                # Harbor does NOT reject an equivalent duplicate immutable rule
+                # (it inserts without comparing selectors), so unlike projects
+                # and members this lookup is the only thing keeping re-runs
+                # idempotent - it has to be right.
+                # page_size=100 is Harbor's maximum; a project with more rules
+                # than that cannot be checked in one page, so bail out loudly
+                # rather than silently duplicating rules.
+                status=$(curl -s -o /tmp/rules.json -w '%{http_code}' -u "$AUTH" \
+                  -H "$NAME_HDR" \
+                  "${HARBOR_API}/projects/${name}/immutabletagrules?page_size=100")
+                if [ "$status" != "200" ]; then
+                  echo "project ${name}: listing immutable rules failed (HTTP ${status}):" >&2
+                  cat /tmp/rules.json >&2
+                  return 1
+                fi
+                # Put each rule on its own line ("id" only ever opens a rule
+                # object) and keep only lines carrying both selector keys. grep
+                # also guarantees a trailing newline for the read loop below.
+                sed 's/{"id":/\n{"id":/g' /tmp/rules.json \
+                  | grep '"tag_selectors"' \
+                  | grep '"scope_selectors"' > /tmp/rules.txt || true
+                if [ "$(wc -l < /tmp/rules.txt)" -ge 100 ]; then
+                  echo "project ${name}: 100+ immutable tag rules returned (page limit) - cannot verify idempotently; dedupe them manually." >&2
+                  return 1
+                fi
+                while IFS= read -r rule; do
+                  # Compare the tag pattern only against the tag_selectors half
+                  # of THIS rule and the repo pattern only against its
+                  # scope_selectors half, so a pattern cannot match the wrong
+                  # selector, the wrong rule, or both greps at once.
+                  tags=${rule%%\"scope_selectors\"*}
+                  scopes=${rule#*\"scope_selectors\"}
+                  printf '%s' "$tags" | grep -qF "\"pattern\":\"${tag_pattern}\"" || continue
+                  printf '%s' "$scopes" | grep -qF "\"pattern\":\"${repo_pattern}\"" || continue
                   echo "project ${name}: immutable rule ${tag_pattern} on ${repo_pattern} already present"
                   return 0
-                fi
+                done < /tmp/rules.txt
                 payload=$(printf '{"disabled":false,"action":"immutable","template":"immutable_template","tag_selectors":[{"kind":"doublestar","decoration":"matches","pattern":"%s"}],"scope_selectors":{"repository":[{"kind":"doublestar","decoration":"repoMatches","pattern":"%s"}]}}' \
                   "$tag_pattern" "$repo_pattern")
                 status=$(curl -s -o /tmp/resp.txt -w '%{http_code}' -u "$AUTH" \
@@ -184,6 +221,8 @@ spec:
                   -d "$payload")
                 case "$status" in
                   201) echo "project ${name}: immutable rule ${tag_pattern} on ${repo_pattern} created" ;;
+                  # Harbor does not currently 409 on an equivalent rule; handled
+                  # only in case a future version starts to.
                   409) echo "project ${name}: immutable rule ${tag_pattern} on ${repo_pattern} already present (409)" ;;
                   *)
                     echo "project ${name}: immutable rule ${tag_pattern} on ${repo_pattern} failed (HTTP ${status}):" >&2
