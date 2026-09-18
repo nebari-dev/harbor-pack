@@ -17,18 +17,40 @@
   NebariApp's ServiceAccount (same name as the NebariApp), which the operator
   grants read access to the OIDC Secret.
 */}}
-{{- /* Validate the enum unconditionally so a typo fails the render, not the Job. */}}
-{{- $restriction := .Values.oidcSetup.projectCreationRestriction | default "" }}
+{{- /*
+  Validate unconditionally so mistakes fail the render rather than the Job.
+  Check the raw value before defaulting: `default` turns YAML false/0 into "",
+  which would silently mean "leave the setting unmanaged".
+*/}}
+{{- $rawRestriction := .Values.oidcSetup.projectCreationRestriction }}
+{{- if and (not (kindIs "invalid" $rawRestriction)) (not (kindIs "string" $rawRestriction)) }}
+{{- fail (printf "oidcSetup.projectCreationRestriction must be a string (\"adminonly\", \"everyone\", or \"\"); got %v of type %s" $rawRestriction (kindOf $rawRestriction)) }}
+{{- end }}
+{{- $restriction := $rawRestriction | default "" }}
 {{- if not (has $restriction (list "" "adminonly" "everyone")) }}
 {{- fail (printf "oidcSetup.projectCreationRestriction must be \"adminonly\", \"everyone\", or \"\" (leave Harbor's current setting); got %q" $restriction) }}
+{{- end }}
+{{- /*
+  Keys this Job owns. The systemConfig fragment is appended after them in the
+  payload, so a duplicate would win over the chart-managed value (JSON decoders
+  take the last occurrence). Reject them by name instead of dropping silently.
+*/}}
+{{- $reservedKeys := list "auth_mode" "oidc_name" "oidc_endpoint" "oidc_client_id" "oidc_client_secret" "oidc_scope" "oidc_groups_claim" "oidc_admin_group" "oidc_user_claim" "oidc_auto_onboard" "oidc_verify_cert" "project_creation_restriction" }}
+{{- range $key, $value := (.Values.oidcSetup.systemConfig | default dict) }}
+{{- if has $key $reservedKeys }}
+{{- fail (printf "oidcSetup.systemConfig may not set %q: it is managed by the OIDC config Job. Use the dedicated oidcSetup option (e.g. oidcSetup.projectCreationRestriction) instead." $key) }}
+{{- end }}
 {{- end }}
 
 {{- if and .Values.nebariapp.enabled .Values.nebariapp.auth.enabled .Values.oidcSetup.enabled }}
 {{- /*
-  Merge oidcSetup.systemConfig with the explicit options (which win on conflict)
-  and render "key": value pairs with toJson, so numbers and booleans stay
-  unquoted and strings are quoted/escaped correctly. The result is a fragment
-  that is appended to the payload object, hence the leading comma.
+  Assemble the system-settings fragment: oidcSetup.systemConfig plus the
+  explicit options. Pairs are rendered with toJson so numbers and booleans stay
+  unquoted and strings are quoted/escaped correctly. The result is appended to
+  the payload object, hence the leading comma.
+
+  "$" is doubled because Kubernetes expands $(VAR) references inside env value
+  fields; it collapses "$$" back to a single "$" before the container sees it.
 */}}
 {{- $systemConfig := merge (dict) (.Values.oidcSetup.systemConfig | default dict) }}
 {{- if $restriction }}
@@ -40,7 +62,7 @@
 {{- end }}
 {{- $systemConfigJSON := "" }}
 {{- if $pairs }}
-{{-   $systemConfigJSON = printf ",%s" (join "," $pairs) }}
+{{-   $systemConfigJSON = printf ",%s" (join "," $pairs) | replace "$" "$$" }}
 {{- end }}
 apiVersion: batch/v1
 kind: Job

@@ -154,13 +154,14 @@ Other editable Harbor system settings can be set through the same call without a
 oidcSetup:
   systemConfig:
     robot_name_prefix: "robot$"
-    robot_token_duration: 43200          # minutes
+    robot_token_duration: 30             # days
     audit_log_forward_endpoint: "syslog://logger:5140"
 ```
 
 Keys are Harbor config-API names and values keep their YAML type (numbers and booleans are
-sent unquoted). Explicit values such as `projectCreationRestriction` win if the same key also
-appears in `systemConfig`.
+sent unquoted). Keys the Job manages itself — `auth_mode`, the `oidc_*` settings, and
+`project_creation_restriction` — are rejected at render time with a message naming the key,
+so they cannot silently override the chart; use the dedicated `oidcSetup` option instead.
 
 ### Pushing images / artifacts
 

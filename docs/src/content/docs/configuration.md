@@ -94,14 +94,15 @@ oidcSetup:
   projectCreationRestriction: adminonly
   systemConfig:
     robot_name_prefix: "robot$"
-    robot_token_duration: 43200          # minutes
+    robot_token_duration: 30             # days
     audit_log_forward_endpoint: "syslog://logger:5140"
 ```
 
 `systemConfig` keys are Harbor config-API names and values keep their YAML type (numbers and
 booleans are sent unquoted, strings quoted), so new settings need no chart change. Settings
-with security implications keep an explicit value of their own, and those win if the same key
-also appears in `systemConfig`.
+with security implications keep an explicit value of their own: `auth_mode`, the `oidc_*`
+settings, and `project_creation_restriction` are rejected in `systemConfig` (the render fails
+naming the key) so they cannot silently override the chart-managed values.
 
 With `oidcSetup.autoOnboard` enabled, everyone who can log in through Keycloak gets a Harbor
 account, so the pack defaults `projectCreationRestriction` to `adminonly`. Harbor's own

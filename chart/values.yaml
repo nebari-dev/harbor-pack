@@ -91,10 +91,12 @@ oidcSetup:
   # payload (numbers and booleans unquoted, strings quoted), e.g.:
   #   systemConfig:
   #     robot_name_prefix: "robot$"
-  #     robot_token_duration: 43200          # minutes
+  #     robot_token_duration: 30             # days
   #     audit_log_forward_endpoint: "syslog://logger:5140"
-  # Settings with security implications keep their own explicit value above;
-  # those win if the same key is also set here.
+  # Settings with security implications keep their own explicit value above.
+  # Keys this Job manages (auth_mode, oidc_*, project_creation_restriction) are
+  # rejected here rather than silently overriding the chart - use the dedicated
+  # option instead.
   systemConfig: {}
   # Harbor admin credentials. The upstream chart writes them to the core Secret;
   # leave these empty to read from that Secret (name/key computed by default), or
