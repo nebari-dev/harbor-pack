@@ -76,6 +76,28 @@ oidcSetup:
   userClaim: preferred_username
   autoOnboard: true
   verifyCert: true
+  # Who may create projects (Harbor's `project_creation_restriction` setting):
+  #   adminonly - only Harbor system admins can create projects
+  #   everyone  - any logged-in user can create projects (upstream Harbor default)
+  #   ""        - do not manage the setting (the Job leaves Harbor's value alone)
+  # This Job only runs on SSO installs, where autoOnboard means "everyone" is
+  # every user who can log in to Keycloak - usually not who should be able to
+  # create projects on a shared registry - so the pack defaults to adminonly.
+  # Standalone installs never render this Job and keep Harbor's own default.
+  projectCreationRestriction: adminonly
+  # Extra editable Harbor system settings, merged into the same
+  # PUT /api/v2.0/configurations call so they can be set without a chart change.
+  # Keys are Harbor config API names and values keep their YAML type in the JSON
+  # payload (numbers and booleans unquoted, strings quoted), e.g.:
+  #   systemConfig:
+  #     robot_name_prefix: "robot$"
+  #     robot_token_duration: 30             # days
+  #     audit_log_forward_endpoint: "syslog://logger:5140"
+  # Settings with security implications keep their own explicit value above.
+  # Keys this Job manages (auth_mode, oidc_*, project_creation_restriction) are
+  # rejected here rather than silently overriding the chart - use the dedicated
+  # option instead.
+  systemConfig: {}
   # Harbor admin credentials. The upstream chart writes them to the core Secret;
   # leave these empty to read from that Secret (name/key computed by default), or
   # override to point at your own Secret.
