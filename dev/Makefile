@@ -4,25 +4,38 @@
 # (MetalLB, Envoy Gateway, cert-manager, Keycloak, nebari-operator)
 # and deploys Harbor with the NebariApp + Keycloak SSO wired in.
 #
-# Prerequisites: docker, kind, helm, kubectl, git
+# Prerequisites: docker, kind, helm, kubectl, python3, git
 #
 # Usage:
-#   make up             Deploy harbor-pack on Nebari (NebariApp + server-side OIDC)
-#   make up-sso         Deploy with the FULL browser SSO flow (see dev/enable-sso.sh)
-#   make host-access    Bridge host :80/:443 to the gateway (no sudo) + print /etc/hosts line
-#   make up-standalone  Deploy Harbor standalone (no operator/Keycloak needed)
-#   make down           Delete the kind cluster
+#   make up               Deploy harbor-pack on Nebari (NebariApp + server-side OIDC)
+#   make up-sso           Deploy with the FULL browser SSO flow (see dev/enable-sso.sh)
+#   make host-access      Bridge host :80/:443 to the gateway (no sudo) + print /etc/hosts line
+#   make seed-user        (Re)create the Keycloak SSO login used by the dev flow
+#   make harbor-bootstrap Grant the SSO user admin + a project (after its first login)
+#   make up-standalone    Deploy Harbor standalone (no operator/Keycloak needed)
+#   make down             Delete the kind cluster
 #
 # Typical full-SSO run:
 #   make up-sso && make host-access
 #   sudo sh -c 'echo "127.0.0.1 harbor.nebari.local keycloak.nebari.local" >> /etc/hosts'
-#   open https://harbor.nebari.local
+#   open https://harbor.nebari.local     # log in as dev / dev-password
+#   make harbor-bootstrap                # after that first login
+#
+# If a run dies partway through cluster setup, the next `make up-sso` reuses the
+# half-built cluster (the `cluster` target only checks that kind knows the name). Re-run
+# the step that failed - `make _metallb` / `_services` / `_keycloak-setup` / `_operator` -
+# or start clean with `make down`.
 
 CHART         := ../chart
 CLUSTER_NAME  := harbor-pack-dev
 NAMESPACE     := harbor
 HOSTNAME      := harbor.nebari.local
 ADMIN_PW      := Harbor12345
+# Keycloak realm user the SSO flow logs in as. It must NOT be `admin`: Harbor has a
+# built-in local-DB `admin`, and its OIDC auto-onboard refuses to create a second one.
+SSO_USER      := dev
+SSO_PW        := dev-password
+SSO_PROJECT   := dev
 CACHE_DIR     := .cache
 OPERATOR_REPO := $(CACHE_DIR)/nebari-operator
 OPERATOR_REF  := v0.1.0-alpha.19
@@ -48,7 +61,8 @@ spec:
 endef
 export METALLB_POOL
 
-.PHONY: up up-sso host-access up-standalone down cluster update-hosts
+.PHONY: up up-sso host-access up-standalone down cluster update-hosts \
+        seed-user harbor-bootstrap
 
 # --------------------------------------------------------------------------
 # cluster - create kind cluster with full Nebari infrastructure
@@ -81,10 +95,11 @@ _kind-create:
 _metallb:
 	@echo "Installing MetalLB..."
 	kubectl apply -f https://raw.githubusercontent.com/metallb/metallb/v0.14.8/config/manifests/metallb-native.yaml 2>&1 | grep -v "unrecognized format" || true
+	@# 180s, not 90s: the first run pulls the MetalLB images cold.
 	kubectl wait --namespace metallb-system \
-		--for=condition=available deployment/controller --timeout=90s
+		--for=condition=available deployment/controller --timeout=180s
 	kubectl wait --namespace metallb-system \
-		--for=jsonpath='{.status.numberReady}'=1 daemonset/speaker --timeout=90s
+		--for=jsonpath='{.status.numberReady}'=1 daemonset/speaker --timeout=180s
 	@KIND_NET_CIDR=$$(docker network inspect kind -f '{{range .IPAM.Config}}{{.Subnet}}{{"\n"}}{{end}}' 2>/dev/null | grep '\.' | head -n1); \
 	BASE_IP=$$(echo $${KIND_NET_CIDR} | awk -F. '{print $$1"."$$2}'); \
 	echo "MetalLB IP pool: $${BASE_IP}.255.200-$${BASE_IP}.255.250"; \
@@ -143,10 +158,33 @@ up: cluster
 # up-sso - deploy with the full host browser SSO flow
 #   Wires KEYCLOAK_EXTERNAL_URL, a Keycloak gateway route, X-Forwarded headers,
 #   and in-cluster DNS so the Keycloak issuer is identical from browser and from
-#   Harbor core. Prints the two sudo host-access commands at the end.
+#   Harbor core. Seeds the $(SSO_USER) realm user to log in as (see seed-user).
+#   Prints the two sudo host-access commands at the end.
 # --------------------------------------------------------------------------
 up-sso: cluster
-	OPERATOR_REPO=$(OPERATOR_REPO) CLUSTER_NAME=$(CLUSTER_NAME) bash ../dev/enable-sso.sh
+	OPERATOR_REPO=$(OPERATOR_REPO) CLUSTER_NAME=$(CLUSTER_NAME) \
+	SEED_USER=$(SSO_USER) SEED_PASSWORD=$(SSO_PW) \
+	HARBOR_ADMIN_PASSWORD=$(ADMIN_PW) bash ../dev/enable-sso.sh
+
+# --------------------------------------------------------------------------
+# seed-user - (re)create the Keycloak realm user the SSO flow logs in as
+#   Run by up-sso already. Run it again by hand after a Keycloak pod restart: the dev
+#   stack runs Keycloak in `start-dev` (in-memory H2), so a restart wipes realm + user
+#   (recreate the realm first with
+#   $(OPERATOR_REPO)/dev/scripts/services/keycloak/setup.sh).
+# --------------------------------------------------------------------------
+seed-user:
+	SEED_USER=$(SSO_USER) SEED_PASSWORD=$(SSO_PW) bash seed-user.sh
+
+# --------------------------------------------------------------------------
+# harbor-bootstrap - make the SSO user useful, AFTER its first browser login
+#   Grants system admin, creates a project, adds the user as project admin, and prints
+#   the `nebi registry add` line. Harbor only knows an OIDC user once it has onboarded.
+# --------------------------------------------------------------------------
+harbor-bootstrap:
+	NAMESPACE=$(NAMESPACE) HARBOR_ADMIN_PASSWORD=$(ADMIN_PW) \
+	HARBOR_HOSTNAME=$(HOSTNAME) SEED_USER=$(SSO_USER) PROJECT=$(SSO_PROJECT) \
+	bash harbor-bootstrap.sh
 
 # --------------------------------------------------------------------------
 # up-standalone - deploy Harbor without Nebari integration
