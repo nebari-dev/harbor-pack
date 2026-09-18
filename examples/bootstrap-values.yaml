@@ -1,4 +1,5 @@
-# Declarative Harbor projects, applied by the post-install bootstrap Job.
+# Declarative Harbor projects and webhook policies, applied by the post-install
+# bootstrap Job.
 #
 #   helm install harbor . -n harbor --create-namespace \
 #     -f standalone-values.yaml -f bootstrap-values.yaml
@@ -22,3 +23,28 @@ bootstrap:
           repoPattern: "**"
     - name: shared
       public: true
+
+  # Webhook policies are matched by (project, name) and rewritten in place, so
+  # editing `endpoint` or `events` below and re-running `helm upgrade` updates
+  # the existing policy rather than adding a second one.
+  #
+  # The `authHeader` Secret must already exist in the release namespace, e.g.
+  #
+  #   kubectl create secret generic harbor-webhook-cog-index -n harbor \
+  #     --from-literal=authorization="Bearer $(cat token)"
+  webhooks:
+    - project: cogs
+      name: collab-hub-cog-index
+      endpoint: https://collab-hub.example.com/cogs/registry-events
+      events: [PUSH_ARTIFACT, DELETE_ARTIFACT]
+      payloadFormat: Default     # Default | CloudEvents
+      authHeader:                # sent verbatim as the Authorization header
+        secretName: harbor-webhook-cog-index
+        secretKey: authorization
+      skipCertVerify: false
+      enabled: true
+    # No authHeader: the endpoint is unauthenticated (or authenticates by URL).
+    - project: shared
+      name: scan-results
+      endpoint: https://hooks.example.com/harbor/scans
+      events: [SCANNING_COMPLETED, SCANNING_FAILED]

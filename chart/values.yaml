@@ -107,8 +107,9 @@ oidcSetup:
 # =============================================================================
 # Harbor project bootstrap Job
 # =============================================================================
-# Harbor never auto-creates projects, and projects (with their members and tag
-# immutability rules) live in Harbor's database, not in Helm values. This
+# Harbor never auto-creates projects, and projects (with their members, tag
+# immutability rules and webhook policies) live in Harbor's database, not in
+# Helm values. This
 # post-install/upgrade hook Job applies the declarations below through Harbor's
 # REST API after the OIDC Job (hook weight 10 vs 5). It is idempotent - a repeat
 # `helm upgrade` is a no-op - and works with nebariapp.enabled: false too.
@@ -127,6 +128,27 @@ bootstrap:
   #     immutableTags:
   #       - tagPattern: "sha-*"
   #         repoPattern: "**"
+
+  # Project webhook policies, applied by the same Job after the projects above.
+  # Each policy's `project` must be listed in `projects` or already exist.
+  # Unlike the projects, webhooks are updated in place: an existing policy with
+  # the same name is rewritten, so endpoint/event changes here reach Harbor on
+  # the next `helm upgrade` without leaving a duplicate behind.
+  webhooks: []
+  # webhooks:
+  #   - project: cogs
+  #     name: collab-hub-cog-index
+  #     endpoint: https://collab-hub.example.com/cogs/registry-events
+  #     events: [PUSH_ARTIFACT, DELETE_ARTIFACT]
+  #     payloadFormat: Default    # Default | CloudEvents
+  #     # Optional: sent verbatim as the Authorization header. The value comes
+  #     # only from this Secret, which must exist in the release namespace - it
+  #     # is never read from values and is never logged.
+  #     authHeader:
+  #       secretName: harbor-webhook-cog-index
+  #       secretKey: authorization
+  #     skipCertVerify: false
+  #     enabled: true             # false keeps the policy but stops delivery
 
 # =============================================================================
 # Harbor (upstream subchart) overrides
