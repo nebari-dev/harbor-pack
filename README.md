@@ -19,6 +19,7 @@ chart and adds Nebari integration: gateway routing, a landing-page card, and **K
 | Landing card | `NebariApp.spec.landingPage` renders a Harbor card on the Nebari landing page. |
 | **SSO** | The operator provisions a Keycloak OIDC client + Secret; a post-install Job switches Harbor into `oidc_auth` mode using those credentials. See [Authentication](#authentication). |
 | Projects | `bootstrap.projects[]` declares projects, group roles, and tag immutability rules; an idempotent post-install Job applies them. See [Declarative projects](#declarative-projects). |
+| Webhooks | `bootstrap.webhooks[]` declares project webhook policies (endpoint, events, Secret-sourced auth header); the same Job creates or updates them. See [Webhook policies](#webhook-policies). |
 | Storage | Bundled Postgres/Redis + filesystem registry storage by default; toggles for S3/MinIO object storage and external managed Postgres/Redis. |
 
 ## Prerequisites
@@ -184,6 +185,50 @@ configured; Keycloak group members get the role on their next login. Names, grou
 patterns are rendered into the Job's script as quoted literals; `helm template` fails if one
 contains a double quote, backslash or control character.
 
+## Webhook policies
+
+Anything that needs to react to what lands in Harbor — a mirror, an index, a downstream
+build — subscribes to a project webhook. Those are per-project database state too, so declare
+them alongside the projects and the same Job applies them:
+
+```yaml
+bootstrap:
+  webhooks:
+    - project: cogs                # must be in bootstrap.projects, or already exist
+      name: collab-hub-cog-index
+      endpoint: https://collab-hub.example.com/cogs/registry-events
+      events: [PUSH_ARTIFACT, DELETE_ARTIFACT]
+      payloadFormat: Default       # Default | CloudEvents
+      authHeader:                  # optional; sent verbatim as the Authorization header
+        secretName: harbor-webhook-cog-index
+        secretKey: authorization
+      skipCertVerify: false
+      enabled: true
+```
+
+The auth header value comes **only from a Secret**, never from values — create it in the
+release namespace before installing:
+
+```bash
+kubectl create secret generic harbor-webhook-cog-index -n harbor \
+  --from-literal=authorization="Bearer $(cat token)"
+```
+
+The kubelet injects it into the bootstrap Job as an environment variable, so the Job still
+needs no Kubernetes permissions; the value is written straight into the request body and is
+never logged (it is also kept off curl's command line, and redacted if Harbor echoes it back
+in an error).
+
+Unlike projects, webhooks are **updated in place**: the Job matches an existing policy by
+`(project, name)` and `PUT`s the full desired body, so editing `endpoint` or `events` and
+re-running `helm upgrade` changes the existing policy instead of adding a second one. As with
+immutable tag rules that lookup is the only guard against duplicates — a `409` there means it
+missed — so it is bounded by `X-Total-Count` and gives up loudly rather than guessing. Event
+types are validated against what the running Harbor reports at
+`GET /projects/{name}/webhook/events`, so a typo fails the Job with the supported list rather
+than quietly creating a policy that never fires. Setting `enabled: false` keeps the policy but
+stops delivery; removing an entry from values does **not** delete the policy from Harbor.
+
 ## Storage & backing services
 
 Defaults are bundled (Harbor's in-chart Postgres/Redis on PVCs, filesystem registry storage)
@@ -219,6 +264,16 @@ and [`examples/nebari-values.yaml`](examples/nebari-values.yaml):
 | `bootstrap.projects[].members[].role` | — | `projectAdmin`, `maintainer`, `developer`, `guest`, or `limitedGuest`. |
 | `bootstrap.projects[].immutableTags[].tagPattern` | — | Doublestar tag pattern made immutable. |
 | `bootstrap.projects[].immutableTags[].repoPattern` | `**` | Repositories the rule applies to. |
+| `bootstrap.webhooks` | `[]` | Project webhook policies (see [Webhook policies](#webhook-policies)). |
+| `bootstrap.webhooks[].project` | — | Required; project the policy belongs to. Must be in `bootstrap.projects` or already exist. |
+| `bootstrap.webhooks[].name` | — | Required; policy name. Identifies the policy for updates. |
+| `bootstrap.webhooks[].endpoint` | — | Required; `http://` or `https://` URL Harbor posts to. |
+| `bootstrap.webhooks[].events` | — | Required; Harbor event types, e.g. `[PUSH_ARTIFACT, DELETE_ARTIFACT]`. Validated against the running Harbor. |
+| `bootstrap.webhooks[].payloadFormat` | `Default` | `Default` or `CloudEvents`. |
+| `bootstrap.webhooks[].authHeader.secretName` | — | Secret holding the Authorization header value. Omit `authHeader` entirely for an unauthenticated endpoint. |
+| `bootstrap.webhooks[].authHeader.secretKey` | — | Key within that Secret. |
+| `bootstrap.webhooks[].skipCertVerify` | `false` | Skip TLS verification of the endpoint. |
+| `bootstrap.webhooks[].enabled` | `true` | `false` keeps the policy but stops delivery. |
 | `harbor.*` | — | Passed to the upstream Harbor chart. |
 
 ## Troubleshooting
@@ -231,7 +286,12 @@ and [`examples/nebari-values.yaml`](examples/nebari-values.yaml):
   (`HARBOR_ADMIN_PASSWORD` must match `harbor.harborAdminPassword`).
 - **Projects missing after install** — check the bootstrap Job:
   `kubectl logs job/harbor-harbor-pack-bootstrap-projects -n <ns>`. It logs one line per
-  project/member/rule; a non-2xx response is printed with Harbor's error body.
+  project/member/rule/webhook; a non-2xx response is printed with Harbor's error body.
+- **Webhook not created** — same Job. `event type X ... not supported` means a typo in
+  `events` (the supported list is printed); `project X does not exist` means the webhook's
+  `project` is not in `bootstrap.projects`. If the Pod never starts, the `authHeader` Secret
+  is probably missing from the release namespace — `kubectl describe pod` shows
+  `CreateContainerConfigError`.
 - **"Login via OIDC Provider" missing** — the Job didn't complete; confirm
   `GET /api/v2.0/configurations` shows `auth_mode=oidc_auth`.
 - **`docker login` fails** — use a **CLI secret** or robot account, not your Keycloak
@@ -245,8 +305,12 @@ and [`examples/nebari-values.yaml`](examples/nebari-values.yaml):
   `helm template` in CI (integration tests use bundled filesystem/Postgres/Redis).
 - `bootstrap.projects` applies missing state only: it creates projects, group members and
   immutability rules, but does not update or remove ones that already exist (changing
-  `public:` for an existing project, or deleting an entry, has no effect). Robot accounts and
-  webhook policies are not covered yet.
+  `public:` for an existing project, or deleting an entry, has no effect). Robot accounts are
+  not covered yet.
+- `bootstrap.webhooks` creates and updates policies but never deletes them: removing an entry
+  from values leaves the policy in Harbor (set `enabled: false` to stop delivery, or delete it
+  in the UI). Like the other listings, the policy lookup reads one page and fails on
+  `X-Total-Count` rather than acting on a truncated list.
 - Upgrades follow upstream Harbor's chart; review upstream release notes before major bumps.
 
 ## License

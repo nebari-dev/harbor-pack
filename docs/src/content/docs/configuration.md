@@ -48,7 +48,64 @@ rules. Changing `public:` for a project that already exists, or removing an entr
 `projects`, has no effect on Harbor.
 
 Follow the Job with `kubectl logs job/<release>-harbor-pack-bootstrap-projects -n <ns>`; it
-prints one line per project, member and rule.
+prints one line per project, member, rule and webhook.
+
+## Webhook policies
+
+Systems that mirror or index what lands in Harbor subscribe to a project webhook. Declare
+those in the same `bootstrap:` block and the same Job applies them, after the projects:
+
+```yaml
+bootstrap:
+  webhooks:
+    - project: cogs                # must be in bootstrap.projects, or already exist
+      name: collab-hub-cog-index
+      endpoint: https://collab-hub.example.com/cogs/registry-events
+      events: [PUSH_ARTIFACT, DELETE_ARTIFACT]
+      payloadFormat: Default       # Default | CloudEvents (default: Default)
+      authHeader:                  # optional; sent verbatim as the Authorization header
+        secretName: harbor-webhook-cog-index
+        secretKey: authorization
+      skipCertVerify: false
+      enabled: true                # false keeps the policy but stops delivery
+```
+
+### The auth header
+
+`authHeader` names a Secret, never a literal — the value stays out of values files and out of
+Git. Create it in the release namespace before installing:
+
+```bash
+kubectl create secret generic harbor-webhook-cog-index -n harbor \
+  --from-literal=authorization="Bearer $(cat token)"
+```
+
+The kubelet injects it into the Job as an environment variable (`WEBHOOK_AUTH_<index>`), so
+the Job still needs no Kubernetes API access. The value goes straight into the request body
+and is never logged — it is kept off curl's command line, and redacted if Harbor echoes the
+request back in an error. Omit `authHeader` for an endpoint that needs no credential; the
+`auth_header` field is then left out of the policy entirely.
+
+If the Secret is missing, the Job's Pod will not start — `kubectl describe pod` reports
+`CreateContainerConfigError`.
+
+### Updates and validation
+
+Webhooks are the one part of `bootstrap` that updates in place. The Job matches an existing
+policy by `(project, name)` and `PUT`s the full desired body, so editing `endpoint` or
+`events` and running `helm upgrade` changes that policy rather than creating a duplicate. It
+still never deletes: dropping an entry from values leaves the policy in Harbor.
+
+That lookup is the only thing preventing a duplicate — Harbor's `409` on the create means the
+lookup missed, and is treated as fatal — so it is held to the same standard as the immutable
+tag rules: one page bounded by `X-Total-Count`, and a loud failure if the policy is found but
+its id cannot be read.
+
+Event types are checked at run time against `GET /projects/{name}/webhook/events` on the
+running Harbor, so a typo fails the Job with the supported list printed rather than creating
+a policy that never fires. A webhook whose `project` does not exist fails with a message
+naming it — list the project in `bootstrap.projects` (it is created earlier in the same run)
+or create it first.
 
 ## Storage
 
@@ -130,6 +187,16 @@ harbor:
 | `bootstrap.projects[].members[].role` | — | `projectAdmin`, `maintainer`, `developer`, `guest`, or `limitedGuest`. |
 | `bootstrap.projects[].immutableTags[].tagPattern` | — | Doublestar tag pattern made immutable. |
 | `bootstrap.projects[].immutableTags[].repoPattern` | `**` | Repositories the rule applies to. |
+| `bootstrap.webhooks` | `[]` | Project webhook policies (see [above](#webhook-policies)). |
+| `bootstrap.webhooks[].project` | — | Required; project the policy belongs to. |
+| `bootstrap.webhooks[].name` | — | Required; policy name, and the key used for updates. |
+| `bootstrap.webhooks[].endpoint` | — | Required; `http://` or `https://` URL Harbor posts to. |
+| `bootstrap.webhooks[].events` | — | Required; Harbor event types, e.g. `[PUSH_ARTIFACT, DELETE_ARTIFACT]`. |
+| `bootstrap.webhooks[].payloadFormat` | `Default` | `Default` or `CloudEvents`. |
+| `bootstrap.webhooks[].authHeader.secretName` | — | Secret holding the Authorization header value. |
+| `bootstrap.webhooks[].authHeader.secretKey` | — | Key within that Secret. |
+| `bootstrap.webhooks[].skipCertVerify` | `false` | Skip TLS verification of the endpoint. |
+| `bootstrap.webhooks[].enabled` | `true` | `false` keeps the policy but stops delivery. |
 | `harbor.externalURL` | — | Set to `https://<hostname>`. |
 | `harbor.harborAdminPassword` | — | Admin password; supply at install time. |
 
