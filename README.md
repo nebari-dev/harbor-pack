@@ -135,6 +135,33 @@ Harbor's OIDC settings live in its database (not Helm values), so the
 `PUT /api/v2.0/configurations` to enable `oidc_auth`. The Job runs as the NebariApp's
 ServiceAccount, which the operator grants read access to the OIDC Secret.
 
+### Who can create projects
+
+The same Job also sets Harbor's `project_creation_restriction`. With `oidcSetup.autoOnboard`
+(the default) every user who can log in through Keycloak gets a Harbor account, so the pack
+defaults to **`adminonly`**: only Harbor system admins create projects.
+
+> **Upgrade note:** this changes behaviour for existing SSO installs. Harbor's own default is
+> `everyone`, so before this change any onboarded OIDC user could create projects; after
+> upgrading, they cannot. To keep the old behaviour, set
+> `oidcSetup.projectCreationRestriction: everyone`, or set it to `""` to leave whatever is
+> currently configured in Harbor untouched. Standalone installs (`oidcSetup.enabled=false`)
+> do not run the Job and are unaffected.
+
+Other editable Harbor system settings can be set through the same call without a chart change:
+
+```yaml
+oidcSetup:
+  systemConfig:
+    robot_name_prefix: "robot$"
+    robot_token_duration: 43200          # minutes
+    audit_log_forward_endpoint: "syslog://logger:5140"
+```
+
+Keys are Harbor config-API names and values keep their YAML type (numbers and booleans are
+sent unquoted). Explicit values such as `projectCreationRestriction` win if the same key also
+appears in `systemConfig`.
+
 ### Pushing images / artifacts
 
 ```sh
@@ -170,6 +197,8 @@ and [`examples/nebari-values.yaml`](examples/nebari-values.yaml):
 | `oidcSetup.enabled` | `true` | Run the Job that switches Harbor to `oidc_auth`. |
 | `oidcSetup.adminGroup` | `""` | Keycloak group mapped to Harbor system-admin. |
 | `oidcSetup.autoOnboard` | `true` | Auto-create Harbor users on first OIDC login. |
+| `oidcSetup.projectCreationRestriction` | `adminonly` | Who may create projects: `adminonly`, `everyone`, or `""` to leave Harbor's setting alone. |
+| `oidcSetup.systemConfig` | `{}` | Extra Harbor system settings (config-API keys) merged into the same configuration call. |
 | `harbor.*` | — | Passed to the upstream Harbor chart. |
 
 ## Troubleshooting

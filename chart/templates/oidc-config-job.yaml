@@ -7,11 +7,41 @@
   nebari-operator provisioned into <nebariapp-fullname>-oidc-client and switches
   Harbor into oidc_auth mode pointing at Keycloak.
 
+  The same call also carries general system settings: the explicit
+  oidcSetup.projectCreationRestriction option plus anything in
+  oidcSetup.systemConfig. Those are assembled into one JSON fragment at template
+  time (SYSTEM_CONFIG_JSON below) so each value keeps its YAML type - the config
+  image has no jq to build JSON at runtime.
+
   Rendered only when Nebari auth AND oidcSetup are enabled. The Job runs as the
   NebariApp's ServiceAccount (same name as the NebariApp), which the operator
   grants read access to the OIDC Secret.
 */}}
+{{- /* Validate the enum unconditionally so a typo fails the render, not the Job. */}}
+{{- $restriction := .Values.oidcSetup.projectCreationRestriction | default "" }}
+{{- if not (has $restriction (list "" "adminonly" "everyone")) }}
+{{- fail (printf "oidcSetup.projectCreationRestriction must be \"adminonly\", \"everyone\", or \"\" (leave Harbor's current setting); got %q" $restriction) }}
+{{- end }}
+
 {{- if and .Values.nebariapp.enabled .Values.nebariapp.auth.enabled .Values.oidcSetup.enabled }}
+{{- /*
+  Merge oidcSetup.systemConfig with the explicit options (which win on conflict)
+  and render "key": value pairs with toJson, so numbers and booleans stay
+  unquoted and strings are quoted/escaped correctly. The result is a fragment
+  that is appended to the payload object, hence the leading comma.
+*/}}
+{{- $systemConfig := merge (dict) (.Values.oidcSetup.systemConfig | default dict) }}
+{{- if $restriction }}
+{{-   $_ := set $systemConfig "project_creation_restriction" $restriction }}
+{{- end }}
+{{- $pairs := list }}
+{{- range $key, $value := $systemConfig }}
+{{-   $pairs = append $pairs (printf "%s: %s" (toJson $key) (toJson $value)) }}
+{{- end }}
+{{- $systemConfigJSON := "" }}
+{{- if $pairs }}
+{{-   $systemConfigJSON = printf ",%s" (join "," $pairs) }}
+{{- end }}
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -62,6 +92,10 @@ spec:
               value: {{ .Values.oidcSetup.autoOnboard | quote }}
             - name: OIDC_VERIFY_CERT
               value: {{ .Values.oidcSetup.verifyCert | quote }}
+            # Pre-rendered JSON fragment (leading comma, or empty) appended to the
+            # configuration payload: project_creation_restriction + systemConfig.
+            - name: SYSTEM_CONFIG_JSON
+              value: {{ $systemConfigJSON | quote }}
             - name: OIDC_CLIENT_ID
               valueFrom:
                 secretKeyRef:
@@ -103,6 +137,8 @@ spec:
               # Build the configuration payload. jq is not present in curl images,
               # so assemble JSON by hand with printf (values come from Keycloak /
               # the operator Secret and contain no embedded quotes).
+              # SYSTEM_CONFIG_JSON was rendered by Helm and is either empty or a
+              # comma-prefixed list of already-typed "key": value pairs.
               PAYLOAD=$(printf '{
                 "auth_mode": "oidc_auth",
                 "oidc_name": "%s",
@@ -114,10 +150,10 @@ spec:
                 "oidc_admin_group": "%s",
                 "oidc_user_claim": "%s",
                 "oidc_auto_onboard": %s,
-                "oidc_verify_cert": %s
+                "oidc_verify_cert": %s%s
               }' "$OIDC_NAME" "$OIDC_ENDPOINT" "$OIDC_CLIENT_ID" "$OIDC_CLIENT_SECRET" \
                  "$OIDC_SCOPE" "$OIDC_GROUPS_CLAIM" "$OIDC_ADMIN_GROUP" "$OIDC_USER_CLAIM" \
-                 "$OIDC_AUTO_ONBOARD" "$OIDC_VERIFY_CERT")
+                 "$OIDC_AUTO_ONBOARD" "$OIDC_VERIFY_CERT" "$SYSTEM_CONFIG_JSON")
 
               echo "Configuring Harbor OIDC (endpoint: ${OIDC_ENDPOINT}) ..."
               STATUS=$(curl -s -o /tmp/resp.txt -w '%{http_code}' \
