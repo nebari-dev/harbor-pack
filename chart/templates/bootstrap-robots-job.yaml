@@ -470,6 +470,7 @@ spec:
                 ROBOT_PASSWORD=""
               }
               {{ $destinations := dict }}
+              {{ $identities := dict }}
               {{- range $robot := .Values.bootstrap.robots }}
               {{- $name := required "bootstrap.robots[].name is required" $robot.name }}
               {{- if not (regexMatch "^[a-z0-9]+([._-][a-z0-9]+)*$" $name) }}
@@ -537,6 +538,14 @@ spec:
               {{- fail (printf "bootstrap: robots %q and %q both write Secret %s - give each robot its own secret.name or secret.namespace" (index $destinations $destination) $name $destination) }}
               {{- end }}
               {{- $destinations = set $destinations $destination $name }}
+              {{- /* The same robot declared twice would rotate its own secret on
+                     every run, leaving the earlier entry's Secret holding a dead
+                     credential that the id-annotation check then trusts. */}}
+              {{- $identity := printf "%s:%s" $level $stored }}
+              {{- if hasKey $identities $identity }}
+              {{- fail (printf "bootstrap: robot %q (%s level%s) is declared more than once - each robot may appear only once in bootstrap.robots" $name $level (ternary (printf ", project %s" $project) "" (eq $level "project"))) }}
+              {{- end }}
+              {{- $identities = set $identities $identity $destination }}
               ensure_robot {{ include "harbor-pack.sh-literal" $name }} {{ include "harbor-pack.sh-literal" $stored }} '{{ $level }}' {{ include "harbor-pack.sh-literal" $project }} '{{ $durationStr }}' '{{ $permissionsJSON }}' {{ include "harbor-pack.sh-literal" $secretNamespace }} {{ include "harbor-pack.sh-literal" $secretName }}
               {{ end }}
               echo "Harbor robot bootstrap complete."
