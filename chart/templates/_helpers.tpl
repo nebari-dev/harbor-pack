@@ -87,14 +87,40 @@ name is fixed as "harbor".
 {{- end }}
 
 {{/*
-Secret holding the Harbor admin password. The upstream chart writes it to the
-core Secret (<harbor-fullname>-core) under key HARBOR_ADMIN_PASSWORD.
+Secret holding the Harbor admin password, for the OIDC-setup Job to read.
+
+The upstream chart writes the password into its core Secret
+(<harbor-fullname>-core, key HARBOR_ADMIN_PASSWORD) - but ONLY while
+harbor.existingSecretAdminPassword is unset. Once it is set (as stableSecrets'
+optional admin-password provisioning requires) upstream omits the key entirely,
+so defaulting to the core Secret would leave the Job in
+CreateContainerConfigError. Follow harbor.existingSecretAdminPassword when it is
+set; an explicit oidcSetup.adminPasswordSecret still wins over both.
 */}}
 {{- define "harbor-pack.admin-secret-name" -}}
+{{- $harborAdminSecret := dig "existingSecretAdminPassword" "" (.Values.harbor | default dict) -}}
 {{- if .Values.oidcSetup.adminPasswordSecret }}
 {{- .Values.oidcSetup.adminPasswordSecret }}
+{{- else if $harborAdminSecret }}
+{{- $harborAdminSecret }}
 {{- else }}
 {{- printf "%s-core" (include "harbor-pack.harbor-fullname" .) }}
+{{- end }}
+{{- end }}
+
+{{/*
+Key within the Secret above. Mirrors the name resolution: when the name comes
+from harbor.existingSecretAdminPassword, the key must come from its companion
+harbor.existingSecretAdminPasswordKey (upstream default HARBOR_ADMIN_PASSWORD).
+*/}}
+{{- define "harbor-pack.admin-secret-key" -}}
+{{- $harborAdminSecret := dig "existingSecretAdminPassword" "" (.Values.harbor | default dict) -}}
+{{- if .Values.oidcSetup.adminPasswordSecret }}
+{{- .Values.oidcSetup.adminPasswordKey }}
+{{- else if $harborAdminSecret }}
+{{- dig "existingSecretAdminPasswordKey" "HARBOR_ADMIN_PASSWORD" (.Values.harbor | default dict) | default "HARBOR_ADMIN_PASSWORD" }}
+{{- else }}
+{{- .Values.oidcSetup.adminPasswordKey }}
 {{- end }}
 {{- end }}
 
@@ -105,4 +131,113 @@ issuer-url).
 */}}
 {{- define "harbor-pack.oidc-secret-name" -}}
 {{- printf "%s-oidc-client" (include "harbor-pack.fullname" .) }}
+{{- end }}
+
+{{/*
+Name shared by the stable-secrets provisioning hook's ServiceAccount, Role,
+RoleBinding and Job.
+*/}}
+{{- define "harbor-pack.stable-secrets.name" -}}
+{{- printf "%s-stable-secrets" (include "harbor-pack.fullname" .) | trunc 63 | trimSuffix "-" }}
+{{- end }}
+
+{{/*
+The registry credential username upstream authenticates with. It is NOT stored
+in the Secret (only the password and the htpasswd line are), so the provisioning
+Job must hash exactly the name the deployments will send.
+*/}}
+{{- define "harbor-pack.stable-secrets.registry-username" -}}
+{{- dig "registry" "credentials" "username" "" (.Values.harbor | default dict) | default "harbor_registry_user" }}
+{{- end }}
+
+{{/*
+Fan-out map: the seven upstream Harbor values keys that must point at the two
+stable Secrets, keyed by dotted path under `harbor:` with the expected value.
+Used by both the validation below and the docs/error message so they cannot
+drift apart.
+*/}}
+{{- define "harbor-pack.stable-secrets.expected" -}}
+{{- $s := .Values.stableSecrets -}}
+{{- $internal := $s.internalSecret | default "" -}}
+{{- $tokenSigning := $s.tokenSigningSecret | default "" -}}
+{{- dict
+      "existingSecretSecretKey" $internal
+      "core.existingSecret" $internal
+      "core.existingXsrfSecret" $internal
+      "core.secretName" $tokenSigning
+      "jobservice.existingSecret" $internal
+      "registry.existingSecret" $internal
+      "registry.credentials.existingSecret" $internal
+    | toJson -}}
+{{- end }}
+
+{{/*
+Validate the stableSecrets fan-out.
+
+Helm cannot set a subchart's values from a parent template - `.Values.harbor` is
+handed to the upstream chart as data, and templates cannot mutate it. So the
+fan-out cannot be applied automatically; instead this fails the render with the
+exact block to paste when `stableSecrets.enabled` is true but the upstream keys
+do not point at the two Secret names. Renders nothing on success.
+*/}}
+{{- define "harbor-pack.stable-secrets.validate" -}}
+{{- $s := .Values.stableSecrets -}}
+{{- $h := .Values.harbor | default dict -}}
+{{- $internal := $s.internalSecret | default "" -}}
+{{- $tokenSigning := $s.tokenSigningSecret | default "" -}}
+{{- if or (eq $internal "") (eq $tokenSigning "") -}}
+{{- fail "stableSecrets.enabled is true but stableSecrets.internalSecret and/or stableSecrets.tokenSigningSecret is empty. Both Secret names are required; see examples/gitops-values.yaml." -}}
+{{- end -}}
+{{- $expected := include "harbor-pack.stable-secrets.expected" . | fromJson -}}
+{{- $actual := dict
+      "existingSecretSecretKey" (dig "existingSecretSecretKey" "" $h)
+      "core.existingSecret" (dig "core" "existingSecret" "" $h)
+      "core.existingXsrfSecret" (dig "core" "existingXsrfSecret" "" $h)
+      "core.secretName" (dig "core" "secretName" "" $h)
+      "jobservice.existingSecret" (dig "jobservice" "existingSecret" "" $h)
+      "registry.existingSecret" (dig "registry" "existingSecret" "" $h)
+      "registry.credentials.existingSecret" (dig "registry" "credentials" "existingSecret" "" $h) -}}
+{{- $wrong := list -}}
+{{- range $key, $want := $expected -}}
+  {{- $got := index $actual $key | toString -}}
+  {{- if ne $got $want -}}
+    {{- $wrong = append $wrong (printf "  harbor.%s = %q (expected %q)" $key $got $want) -}}
+  {{- end -}}
+{{- end -}}
+{{/*
+  Three of upstream's existing-Secret options let you rename the key they read
+  inside the Secret. The provisioning Job writes the default names, so a renamed
+  selector would point the pods at a key that is not there. Require the defaults.
+*/}}
+{{- $keySelectors := dict
+      "core.existingXsrfSecretKey" (list (dig "core" "existingXsrfSecretKey" "" $h | toString) "CSRF_KEY")
+      "jobservice.existingSecretKey" (list (dig "jobservice" "existingSecretKey" "" $h | toString) "JOBSERVICE_SECRET")
+      "registry.existingSecretKey" (list (dig "registry" "existingSecretKey" "" $h | toString) "REGISTRY_HTTP_SECRET") -}}
+{{- range $key, $pair := $keySelectors -}}
+  {{- $got := index $pair 0 -}}
+  {{- $want := index $pair 1 -}}
+  {{- if ne $got $want -}}
+    {{- $wrong = append $wrong (printf "  harbor.%s = %q (must be %q - the Secret is written with the default key names)" $key $got $want) -}}
+  {{- end -}}
+{{- end -}}
+{{- $block := printf "harbor:\n  existingSecretSecretKey: %s\n  core:\n    existingSecret: %s\n    existingXsrfSecret: %s\n    secretName: %s\n  jobservice:\n    existingSecret: %s\n  registry:\n    existingSecret: %s\n    credentials:\n      existingSecret: %s" $internal $internal $internal $tokenSigning $internal $internal $internal -}}
+{{- if dig "adminPassword" "enabled" false $s -}}
+  {{- $adminSecret := dig "adminPassword" "secretName" "" $s -}}
+  {{- $adminKey := dig "adminPassword" "key" "" $s -}}
+  {{- if or (eq $adminSecret "") (eq $adminKey "") -}}
+    {{- fail "stableSecrets.adminPassword.enabled is true but stableSecrets.adminPassword.secretName and/or .key is empty." -}}
+  {{- end -}}
+  {{- $gotName := dig "existingSecretAdminPassword" "" $h | toString -}}
+  {{- $gotKey := dig "existingSecretAdminPasswordKey" "" $h | toString -}}
+  {{- if ne $gotName $adminSecret -}}
+    {{- $wrong = append $wrong (printf "  harbor.existingSecretAdminPassword = %q (expected %q)" $gotName $adminSecret) -}}
+  {{- end -}}
+  {{- if ne $gotKey $adminKey -}}
+    {{- $wrong = append $wrong (printf "  harbor.existingSecretAdminPasswordKey = %q (expected %q)" $gotKey $adminKey) -}}
+  {{- end -}}
+  {{- $block = printf "%s\n  existingSecretAdminPassword: %s\n  existingSecretAdminPasswordKey: %s" $block $adminSecret $adminKey -}}
+{{- end -}}
+{{- if $wrong -}}
+{{- fail (printf "stableSecrets.enabled is true, but the upstream Harbor values that select the pre-created Secrets are not set (or do not match). Helm cannot set subchart values from a parent template, so these must be supplied alongside stableSecrets.\n\nMismatched:\n%s\n\nAdd to your values:\n\n%s\n\nA ready-made file is committed at examples/gitops-values.yaml.\n" (join "\n" $wrong) $block) -}}
+{{- end -}}
 {{- end }}

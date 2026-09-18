@@ -137,7 +137,7 @@ spec:
               valueFrom:
                 secretKeyRef:
                   name: {{ include "harbor-pack.admin-secret-name" . }}
-                  key: {{ .Values.oidcSetup.adminPasswordKey | quote }}
+                  key: {{ include "harbor-pack.admin-secret-key" . | quote }}
           command:
             - /bin/sh
             - -c
