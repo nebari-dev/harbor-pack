@@ -6,9 +6,12 @@ chart/charts/
 dev/.cache/
 
 # Docs site
-docs/site/node_modules/
-docs/site/dist/
-docs/site/.astro/
+docs/node_modules/
+docs/dist/
+docs/.astro/
 
 # OS
 .DS_Store
+
+# Wrangler CLI cache (local docs deploys)
+.wrangler/
