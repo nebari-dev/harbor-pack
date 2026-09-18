@@ -279,6 +279,18 @@ whole point.
 credentials instead. Use it only on an install whose stored credentials you are willing to
 lose (a dev cluster, or a Harbor with no robot accounts and no replication endpoints yet).
 
+Two paths the preflight check **cannot** catch — the refusal keys off the chart-generated
+`secretKey` still sitting in the core Secret, which is absent in both:
+
+- **Already using your own `harbor.existingSecretSecretKey`?** Point
+  `stableSecrets.internalSecret` at a Secret that carries your *current* key material (either
+  your existing Secret, extended with the other six keys, or a new one built from it). Naming
+  a Secret that does not exist yet makes the Job generate a *fresh* `secretKey`, with the same
+  data loss described above.
+- **Never delete the internal Secret while Harbor holds data.** The Job provisions whatever is
+  absent, so a deleted `harbor-internal` is regenerated — with a new `secretKey` — on the next
+  sync. Back it up alongside the database (see the note on `secretKey` below).
+
 ### Rotating a credential
 
 There is no in-place rotation: recreate the Secret and restart whatever mounts it.
