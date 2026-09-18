@@ -99,6 +99,16 @@ auto-onboard refuses to create a second one and the callback fails with:
 `admin` / `Harbor12345` still works under **Login via Local DB**, and the realm admin remains
 the Keycloak console account. `make seed-user` re-runs the seeding on its own.
 
+The user, its password and the project name are Make variables passed to the scripts through
+the environment, so overriding them is safe even with awkward values:
+
+```sh
+make up-sso SEED_USER=alice SEED_PASSWORD='s3cr3t &pass' HARBOR_PROJECT=scratch
+```
+
+An overridden password is never echoed back — the scripts print `(as configured)` in place of
+anything that isn't the documented default.
+
 ### After the first SSO login — `make harbor-bootstrap`
 
 The dev flow sets no `oidcSetup.adminGroup`, so a freshly onboarded OIDC user has no

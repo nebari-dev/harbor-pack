@@ -31,11 +31,6 @@ CLUSTER_NAME  := harbor-pack-dev
 NAMESPACE     := harbor
 HOSTNAME      := harbor.nebari.local
 ADMIN_PW      := Harbor12345
-# Keycloak realm user the SSO flow logs in as. It must NOT be `admin`: Harbor has a
-# built-in local-DB `admin`, and its OIDC auto-onboard refuses to create a second one.
-SSO_USER      := dev
-SSO_PW        := dev-password
-SSO_PROJECT   := dev
 CACHE_DIR     := .cache
 OPERATOR_REPO := $(CACHE_DIR)/nebari-operator
 OPERATOR_REF  := v0.1.0-alpha.19
@@ -60,6 +55,26 @@ spec:
   - kind-pool
 endef
 export METALLB_POOL
+
+# --------------------------------------------------------------------------
+# Settings for the dev SSO scripts (seed-user.sh, harbor-bootstrap.sh).
+#
+# These are `export`ed rather than interpolated into recipe lines: the scripts read
+# them straight from the environment, so a value containing spaces, quotes or shell
+# metacharacters (an overridden password, say) can neither break the recipe nor inject
+# into it. Override on the command line, e.g. `make seed-user SEED_PASSWORD='s3 cr&t'`.
+#
+# SEED_USER must NOT be `admin`: Harbor has a built-in local-DB `admin`, and its OIDC
+# auto-onboard refuses to create a second one.
+# --------------------------------------------------------------------------
+SEED_USER              := dev
+SEED_PASSWORD          := dev-password
+HARBOR_PROJECT         := dev
+HARBOR_NAMESPACE       := $(NAMESPACE)
+HARBOR_HOSTNAME        := $(HOSTNAME)
+HARBOR_ADMIN_PASSWORD  := $(ADMIN_PW)
+export SEED_USER SEED_PASSWORD HARBOR_PROJECT
+export HARBOR_NAMESPACE HARBOR_HOSTNAME HARBOR_ADMIN_PASSWORD
 
 .PHONY: up up-sso host-access up-standalone down cluster update-hosts \
         seed-user harbor-bootstrap
@@ -158,13 +173,11 @@ up: cluster
 # up-sso - deploy with the full host browser SSO flow
 #   Wires KEYCLOAK_EXTERNAL_URL, a Keycloak gateway route, X-Forwarded headers,
 #   and in-cluster DNS so the Keycloak issuer is identical from browser and from
-#   Harbor core. Seeds the $(SSO_USER) realm user to log in as (see seed-user).
+#   Harbor core. Seeds the SEED_USER realm user to log in as (see seed-user).
 #   Prints the two sudo host-access commands at the end.
 # --------------------------------------------------------------------------
 up-sso: cluster
-	OPERATOR_REPO=$(OPERATOR_REPO) CLUSTER_NAME=$(CLUSTER_NAME) \
-	SEED_USER=$(SSO_USER) SEED_PASSWORD=$(SSO_PW) \
-	HARBOR_ADMIN_PASSWORD=$(ADMIN_PW) bash ../dev/enable-sso.sh
+	OPERATOR_REPO=$(OPERATOR_REPO) CLUSTER_NAME=$(CLUSTER_NAME) bash ../dev/enable-sso.sh
 
 # --------------------------------------------------------------------------
 # seed-user - (re)create the Keycloak realm user the SSO flow logs in as
@@ -174,7 +187,7 @@ up-sso: cluster
 #   $(OPERATOR_REPO)/dev/scripts/services/keycloak/setup.sh).
 # --------------------------------------------------------------------------
 seed-user:
-	SEED_USER=$(SSO_USER) SEED_PASSWORD=$(SSO_PW) bash seed-user.sh
+	bash seed-user.sh
 
 # --------------------------------------------------------------------------
 # harbor-bootstrap - make the SSO user useful, AFTER its first browser login
@@ -182,8 +195,6 @@ seed-user:
 #   the `nebi registry add` line. Harbor only knows an OIDC user once it has onboarded.
 # --------------------------------------------------------------------------
 harbor-bootstrap:
-	NAMESPACE=$(NAMESPACE) HARBOR_ADMIN_PASSWORD=$(ADMIN_PW) \
-	HARBOR_HOSTNAME=$(HOSTNAME) SEED_USER=$(SSO_USER) PROJECT=$(SSO_PROJECT) \
 	bash harbor-bootstrap.sh
 
 # --------------------------------------------------------------------------

@@ -13,6 +13,13 @@
 #
 # Idempotent: an existing user is left in place, and the password is (re)set every run.
 #
+# Read from the environment (the dev Makefile exports them): SEED_USER, SEED_PASSWORD,
+# SEED_EMAIL, REALM, KC_NAMESPACE, KC_POD, KC_SERVER, KC_ADMIN, KC_ADMIN_PASSWORD.
+#
+# Credentials: `kcadm.sh` takes the master password and the seeded password as command-line
+# arguments, so both are visible to anything that can read process state INSIDE the Keycloak
+# pod. That is acceptable for a throwaway dev stack and not a pattern to copy elsewhere.
+#
 # NOTE: the operator dev stack runs Keycloak in `start-dev` (in-memory H2), so a Keycloak
 # pod restart wipes the realm along with this user - re-run `make seed-user` after one
 # (after re-running the operator's keycloak/setup.sh, which recreates the realm).
@@ -66,4 +73,11 @@ fi
 kc set-password -r "$REALM" --username "$SEED_USER" --new-password "$SEED_PASSWORD"
 echo "    password set"
 echo ""
-echo "    Harbor SSO login: $SEED_USER / $SEED_PASSWORD   (Keycloak realm: $REALM)"
+
+# Echo the password back only when it is the documented dev default; an overridden one is
+# the caller's, and has no business in terminal scrollback or CI logs.
+if [ "$SEED_PASSWORD" = "dev-password" ]; then
+  echo "    Harbor SSO login: $SEED_USER / $SEED_PASSWORD   (Keycloak realm: $REALM)"
+else
+  echo "    Harbor SSO login: $SEED_USER / (as configured)   (Keycloak realm: $REALM)"
+fi

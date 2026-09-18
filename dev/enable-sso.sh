@@ -32,6 +32,13 @@ HOSTNAME_HARBOR="harbor.nebari.local"
 HARBOR_ADMIN_PW="${HARBOR_ADMIN_PASSWORD:-Harbor12345}"
 SEED_USER="${SEED_USER:-dev}"
 SEED_PASSWORD="${SEED_PASSWORD:-dev-password}"
+export SEED_USER SEED_PASSWORD
+
+# Echo a password back only when it is the documented dev default; an overridden one is
+# the caller's, and has no business in terminal scrollback or CI logs.
+shown() { if [ "$1" = "$2" ]; then printf '%s' "$1"; else printf '%s' "(as configured)"; fi; }
+SEED_PASSWORD_SHOWN=$(shown "$SEED_PASSWORD" dev-password)
+HARBOR_ADMIN_PW_SHOWN=$(shown "$HARBOR_ADMIN_PW" Harbor12345)
 
 kubectl config use-context "kind-$CLUSTER"
 
@@ -66,7 +73,7 @@ echo "==> 3b. (re)create the nebari realm now that Keycloak is in its final stat
 "$OPERATOR_REPO/dev/scripts/services/keycloak/setup.sh"
 
 echo "==> 4. seed a non-admin realm user for the SSO login (Harbor owns the name 'admin')"
-SEED_USER="$SEED_USER" SEED_PASSWORD="$SEED_PASSWORD" bash "$SCRIPT_DIR/seed-user.sh"
+bash "$SCRIPT_DIR/seed-user.sh"
 
 echo "==> 5. CoreDNS: resolve keycloak.nebari.local to the Envoy gateway ClusterIP in-cluster"
 ENVOY_SVC=$(kubectl get svc -n envoy-gateway-system -l gateway.envoyproxy.io/owning-gateway-name=nebari-gateway -o jsonpath='{.items[0].metadata.name}')
@@ -115,14 +122,14 @@ echo "   # then the one-time /etc/hosts line it prints (needs sudo)"
 echo ""
 echo " Then open https://$HOSTNAME_HARBOR  -> LOGIN VIA OIDC PROVIDER"
 echo ""
-echo "   SSO login (Keycloak realm 'nebari'):  $SEED_USER / $SEED_PASSWORD"
+echo "   SSO login (Keycloak realm 'nebari'):  $SEED_USER / $SEED_PASSWORD_SHOWN"
 echo ""
 echo " (accept the self-signed cert warning for both hostnames)"
 echo ""
 echo " Other accounts, NOT the SSO login:"
 echo "   admin / nebari-admin   - Keycloak realm admin. Harbor already has a local user"
 echo "                            named 'admin', so this one can never onboard over OIDC."
-echo "   admin / $HARBOR_ADMIN_PW    - Harbor's built-in local DB admin (Login via Local DB)."
+echo "   admin / $HARBOR_ADMIN_PW_SHOWN    - Harbor's built-in local DB admin (Login via Local DB)."
 echo ""
 echo " After the first SSO login, give '$SEED_USER' admin + a project to push to:"
 echo "   make harbor-bootstrap"
