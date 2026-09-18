@@ -1,6 +1,6 @@
 ---
 title: Consuming the Registry In-Cluster
-description: Talk to Harbor from a workload running in the same cluster — which Service and paths to use, why the bearer token realm points at the external URL, and which artifacts Trivy does not scan.
+description: Talk to Harbor from a workload running in the same cluster — which Service and paths to use, why the bearer token realm is unusable in-cluster, and which artifacts Trivy does not scan.
 ---
 
 [Registry Setup](/registry-setup/) covers connecting from a laptop, where everything goes through
@@ -8,8 +8,9 @@ the Nebari gateway over HTTPS. A workload running **inside the same cluster** �
 runner, another pack — usually talks to the Harbor front Service directly over plain HTTP, and two
 things behave differently there:
 
-- Harbor's bearer challenge on `/v2/` always advertises a token realm on the **external** URL, so a
-  naive client gets bounced back out through the gateway and has to trust its certificate.
+- The token realm in Harbor's bearer challenge on `/v2/` takes its **scheme** from
+  `harbor.externalURL`, so an in-cluster client is told to fetch its token over **HTTPS** from a
+  Service that only serves HTTP. Following the realm fails either way.
 - Trivy scans container images only. Custom OCI artifacts (Pixi/Nebi bundles and friends) are
   reported as type `UNKNOWN` with no scan data at all.
 
@@ -40,13 +41,16 @@ Three path prefixes matter, all served by that one Service and port:
 | Path | What it is | Auth |
 |---|---|---|
 | `/api/v2.0/...` | Harbor **management API** — projects, repositories, artifacts, webhooks, config | Basic auth (user + CLI secret, or robot) |
-| `/v2/...` | The **OCI registry API** — manifests, blobs, tags | Bearer token from the token service |
-| `/service/token` | Harbor's **token service** — mints the bearer tokens `/v2/` requires | Basic auth, or anonymous for public projects |
+| `/v2/...` | The **OCI registry API** — manifests, blobs, tags | Bearer token from the token service (Basic auth also accepted) |
+| `/service/token` | Harbor's **token service** — mints the bearer tokens OCI clients use | Basic auth, or anonymous for public projects |
 
 :::note
-The two APIs use different credentials in different ways. `/api/v2.0/` takes your username and
-secret directly on every request; `/v2/` never does — it takes a short-lived bearer token that you
-first fetch from `/service/token`. Clients like `docker` and `oras` do that exchange for you.
+The bearer-token exchange is the **standard OCI flow**: a client calls `/v2/`, gets a `401` with a
+token realm, fetches a token from that realm, and retries. `docker`, `oras`, and `helm` all do this
+for you. It is not the only option, though — Harbor also accepts **Basic auth** directly on `/v2/`
+(send an `Authorization: Basic ...` header and it authenticates the request rather than issuing a
+token challenge), which is often the simplest thing for a small in-cluster consumer. `/api/v2.0/`
+always takes the username and secret directly.
 :::
 
 ## Anonymous pulls vs. authenticated access
@@ -64,10 +68,10 @@ Whether you need a credential at all depends on the project:
 Everything on `/api/v2.0/` requires a credential except a handful of unauthenticated endpoints such
 as `/api/v2.0/health`.
 
-## The token realm points at the external URL
+## The token realm is not usable in-cluster
 
 Ask the in-cluster Service for a manifest without a token and Harbor replies with the standard
-bearer challenge:
+bearer challenge — but look at the realm:
 
 ```sh
 curl -sI http://harbor.harbor.svc.cluster.local/v2/
@@ -75,18 +79,35 @@ curl -sI http://harbor.harbor.svc.cluster.local/v2/
 
 ```sh title="Output"
 HTTP/1.1 401 Unauthorized
-Www-Authenticate: Bearer realm="https://harbor.nebari.example.com/service/token",service="harbor-registry"
+Www-Authenticate: Bearer realm="https://harbor.harbor.svc.cluster.local/service/token",service="harbor-registry"
 ```
 
-The realm is built from `harbor.externalURL`, which **must** be the public HTTPS hostname for the
-browser OIDC flow to work. So a client that dutifully follows the challenge leaves the cluster,
-comes back in through the Nebari gateway, and has to complete TLS against the gateway certificate.
-In the local dev stack that certificate is signed by a self-signed CA (`nebari-dev-ca`), and the
-consumer fails with a certificate-verification error that gives no hint it came from the registry.
-In-cluster DNS also has to resolve the external hostname, which is not a given.
+The **host** comes from the request, the **scheme** comes from `harbor.externalURL`. Harbor builds
+the realm in `tokenSvcURL` (`src/server/middleware/v2auth/auth.go`):
 
-There are two ways out. Pick (a) if you control the HTTP calls; pick (b) if you are driving a
-standard client like `docker`, `oras`, or `helm`, which always follow the advertised realm.
+1. If the request's `Host` matches Harbor's configured internal core URL (`CORE_URL`, which the
+   upstream chart sets to `http://<release>-harbor-core:80`), the realm is that internal URL
+   verbatim — plain HTTP.
+2. Otherwise Harbor takes the scheme from the configured external endpoint and glues it onto the
+   request's own `Host`: `<scheme of externalURL>://<request Host>/service/token`. The bundled
+   nginx passes the client's `Host` through unchanged on `/v2/`, so that is whatever hostname the
+   consumer dialled.
+3. Only if the request carries no `Host` at all does Harbor fall back to the external endpoint.
+
+`harbor.externalURL` must be the public **HTTPS** hostname for the browser OIDC flow to work, so
+branch 2 hands an in-cluster consumer an `https://` realm on the in-cluster Service — which this
+pack deliberately serves over plain HTTP only (`harbor.expose.tls.enabled: false`, TLS terminates
+at the Nebari gateway). Following that realm fails at TLS, and no amount of CA trust fixes it,
+because there is no TLS listener on the other end.
+
+The same logic explains the other failure people hit: a consumer that dials Harbor by its
+**external** hostname gets the external realm back, goes out and in through the Nebari gateway, and
+then has to verify the gateway certificate — self-signed (`nebari-dev-ca`) in the local dev stack —
+failing with a certificate error that gives no hint it came from the registry. In-cluster DNS also
+has to resolve the external hostname, which is not a given.
+
+So: pick (a) whenever you control the HTTP calls — it is the reliable in-cluster path. (b) applies
+only to consumers that reach Harbor through the gateway on its external hostname.
 
 ### (a) Ask the in-cluster token service directly
 
@@ -117,9 +138,15 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   "$HARBOR/v2/library/alpine/tags/list"
 
 curl -s -H "Authorization: Bearer $TOKEN" \
-  -H 'Accept: application/vnd.oci.image.manifest.v1+json' \
+  -H 'Accept: application/vnd.oci.image.manifest.v1+json, application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.v2+json, application/vnd.docker.distribution.manifest.list.v2+json' \
   "$HARBOR/v2/library/alpine/manifests/latest"
 ```
+
+:::note
+Send every manifest media type you can handle in `Accept`. A tag often points at an **index**
+(multi-arch manifest list) rather than a single image manifest, and a registry will refuse the
+request if the type it holds is not in your `Accept` header.
+:::
 
 :::tip
 Tokens are scoped to what you asked for and are short-lived. Request one scope per repository you
@@ -128,11 +155,13 @@ The response also carries `expires_in` and `issued_at` if you want to reuse a to
 out.
 :::
 
-### (b) Mount the gateway CA into the consumer
+### (b) Mount the gateway CA — for consumers that use the external hostname
 
-If the consumer is a standard OCI client, it will follow the realm out to the gateway, so the fix
-is to make the gateway certificate verifiable. Mount the CA certificate into the pod and point the
-client's TLS trust at it:
+If the consumer is a standard OCI client (`docker`, `oras`, `helm`), it will always follow the
+advertised realm, so point it at Harbor's **external hostname** and let the whole exchange go
+through the Nebari gateway. Both the `/v2/` call and the realm it returns then use that hostname
+over HTTPS, and the only thing left to fix is trusting the gateway certificate. Mount the CA
+certificate into the pod and point the client's TLS trust at it:
 
 ```yaml
 volumes:
@@ -157,8 +186,10 @@ the bundle at startup.
 :::caution
 This is a workaround for a self-signed or private CA, not a licence to disable verification. Do not
 reach for `--insecure` / `verifyCert: false` in a consumer: the token it fetches over that
-connection is a real credential. With a publicly trusted gateway certificate neither workaround is
-needed — the client follows the realm and verifies normally.
+connection is a real credential. Where the gateway certificate is publicly trusted, this step drops
+away entirely — the client follows the realm and verifies normally. Going through the external
+hostname does mean the traffic leaves and re-enters the cluster, so for a chatty consumer (a) is
+still the better shape.
 :::
 
 ## What Trivy scans — and what it does not
@@ -182,12 +213,15 @@ Two consequences for anything consuming Harbor programmatically:
 - **Do not wait on `SCANNING_COMPLETED`.** No scan is queued for a non-image artifact, so that
   webhook never fires and a consumer that blocks on it hangs forever. Key off `PUSH_ARTIFACT`
   instead, which fires for every artifact type.
-- **Do not expect vulnerability data**, and do not treat its absence as "scan clean". A
-  `scan_overview` that is missing means *not scannable*; only an image with a completed scan
-  carries a real severity summary.
+- **Branch on the artifact `type`, not on the presence of `scan_overview`.** A missing
+  `scan_overview` only means *no scan report is available* — which is equally true of an ordinary
+  image that simply has not been scanned yet. Harbor itself distinguishes "Not Scanned" from
+  "Unsupported"; a consumer that reads "no scan_overview" as "unscannable" (or, worse, as "scan
+  clean") will get both cases wrong.
 
-If a repository mixes images and custom artifacts, branch on the artifact `type` before deciding
-whether scan results are even applicable.
+So in a repository that mixes images and custom artifacts: use the artifact `type` (and its
+manifest media type / `artifactType`) to decide whether vulnerability data is applicable at all,
+and only then look at `scan_overview` to see whether a scan has actually run.
 
 ## Related
 
