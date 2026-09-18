@@ -216,8 +216,12 @@ kubectl create secret generic harbor-webhook-cog-index -n harbor \
 
 The kubelet injects it into the bootstrap Job as an environment variable, so the Job still
 needs no Kubernetes permissions; the value is written straight into the request body and is
-never logged (it is also kept off curl's command line, and redacted if Harbor echoes it back
-in an error).
+never logged. It is kept off curl's command line, and because Harbor quotes the request back
+in some error bodies — where no redaction rule can be trusted, since a quote inside the value
+ends the match early — the Job never reads the response body of a webhook create or update at
+all: those failures report the HTTP status only, and `kubectl logs deploy/harbor-core` has the
+detail. The value must be printable: CR/LF are stripped, and any other control character (a
+stray tab, say) fails the Job with a message naming the Secret, not its contents.
 
 Unlike projects, webhooks are **updated in place**: the Job matches an existing policy by
 `(project, name)` and `PUT`s the full desired body, so editing `endpoint` or `events` and
@@ -286,12 +290,16 @@ and [`examples/nebari-values.yaml`](examples/nebari-values.yaml):
   (`HARBOR_ADMIN_PASSWORD` must match `harbor.harborAdminPassword`).
 - **Projects missing after install** — check the bootstrap Job:
   `kubectl logs job/harbor-harbor-pack-bootstrap-projects -n <ns>`. It logs one line per
-  project/member/rule/webhook; a non-2xx response is printed with Harbor's error body.
+  project/member/rule/webhook; a non-2xx response is printed with Harbor's error body (except
+  for webhook writes — see below).
 - **Webhook not created** — same Job. `event type X ... not supported` means a typo in
   `events` (the supported list is printed); `project X does not exist` means the webhook's
-  `project` is not in `bootstrap.projects`. If the Pod never starts, the `authHeader` Secret
-  is probably missing from the release namespace — `kubectl describe pod` shows
-  `CreateContainerConfigError`.
+  `project` is not in `bootstrap.projects`; `unsupported control characters` means the
+  `authHeader` Secret holds a tab or similar. If the Pod never starts, that Secret is probably
+  missing from the release namespace — `kubectl describe pod` shows
+  `CreateContainerConfigError`. A webhook create/update that fails with a bare HTTP status
+  prints no response body on purpose (Harbor may echo the auth header back); the reason is in
+  `kubectl logs deploy/harbor-core`.
 - **"Login via OIDC Provider" missing** — the Job didn't complete; confirm
   `GET /api/v2.0/configurations` shows `auth_mode=oidc_auth`.
 - **`docker login` fails** — use a **CLI secret** or robot account, not your Keycloak

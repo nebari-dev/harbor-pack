@@ -82,9 +82,19 @@ kubectl create secret generic harbor-webhook-cog-index -n harbor \
 
 The kubelet injects it into the Job as an environment variable (`WEBHOOK_AUTH_<index>`), so
 the Job still needs no Kubernetes API access. The value goes straight into the request body
-and is never logged — it is kept off curl's command line, and redacted if Harbor echoes the
-request back in an error. Omit `authHeader` for an endpoint that needs no credential; the
-`auth_header` field is then left out of the policy entirely.
+and is never logged: it is kept off curl's command line, and the response body of a webhook
+create or update is never read. Harbor quotes the offending request back in some error
+bodies, and redacting that reliably is not something a regular expression can do — a quote
+inside the value ends the match early and leaks the rest — so those failures report the HTTP
+status only. `kubectl logs deploy/harbor-core` has the detail when a 4xx needs chasing.
+
+Omit `authHeader` for an endpoint that needs no credential; the `auth_header` field is then
+left out of the policy entirely.
+
+The value must be printable. A trailing CR/LF (which `--from-literal` and especially
+`--from-file` tend to add) is stripped, but any other control character would need a JSON
+escape this shell script deliberately does not implement, so the Job fails with a message
+naming the webhook and the Secret — never the value itself.
 
 If the Secret is missing, the Job's Pod will not start — `kubectl describe pod` reports
 `CreateContainerConfigError`.
