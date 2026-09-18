@@ -1,11 +1,12 @@
-# Declarative Harbor projects, applied by the post-install bootstrap Job.
+# Declarative Harbor projects and robot accounts, applied by the post-install
+# bootstrap Jobs.
 #
 #   helm install harbor . -n harbor --create-namespace \
 #     -f standalone-values.yaml -f bootstrap-values.yaml
 #
-# The Job is idempotent: existing projects, members and rules are left alone,
-# so re-running `helm upgrade` changes nothing. Members map Keycloak (OIDC)
-# groups to Harbor project roles and therefore need OIDC auth configured.
+# The Jobs are idempotent: existing projects, members, rules and robots are left
+# alone, so re-running `helm upgrade` changes nothing. Members map Keycloak
+# (OIDC) groups to Harbor project roles and therefore need OIDC auth configured.
 
 bootstrap:
   enabled: true
@@ -22,3 +23,34 @@ bootstrap:
           repoPattern: "**"
     - name: shared
       public: true
+
+  # Robot accounts. Each one's credential lands in a Kubernetes Secret with the
+  # keys username / password / registry - the only moment Harbor ever reveals a
+  # robot secret is its create response, so the Job captures it there.
+  robots:
+    # Pull-only indexer for the `cogs` project (the default permission set is
+    # repository:pull, artifact:read, artifact:list, tag:list).
+    - name: hub-cog-indexer
+      level: project
+      project: cogs
+      duration: -1             # never expires; do not rely on Harbor's 30-day default
+      permissions: []
+      secret:
+        name: harbor-robot-hub-cog-indexer
+        namespace: ""          # defaults to the release namespace
+    # A publisher for CI, with push added to the pull-only default.
+    - name: shared-publisher
+      level: project
+      project: shared
+      duration: 365
+      permissions:
+        - resource: repository
+          action: pull
+        - resource: repository
+          action: push
+        - resource: artifact
+          action: read
+        - resource: tag
+          action: create
+      secret:
+        name: harbor-robot-shared-publisher

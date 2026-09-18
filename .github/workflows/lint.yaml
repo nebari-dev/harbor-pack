@@ -45,14 +45,25 @@ jobs:
           # -ignore-missing-schemas: NebariApp CRD schema is not bundled.
           kubeconform -strict -ignore-missing-schemas -summary /tmp/nebari.yaml
 
-      - name: Template (project bootstrap enabled)
+      - name: Template (bootstrap enabled)
         run: |
+          # Without harbor.externalURL: exercises the in-cluster registry-host
+          # fallback the robot Secrets fall back to.
           helm template harbor chart/ \
             --set nebariapp.enabled=false \
             --set harbor.harborAdminPassword=ci \
             -f examples/bootstrap-values.yaml \
             > /tmp/bootstrap.yaml
           kubeconform -strict -ignore-missing-schemas -summary /tmp/bootstrap.yaml
+          # With harbor.externalURL: the normal case, where robot Secrets record
+          # the public registry host.
+          helm template harbor chart/ \
+            --set nebariapp.enabled=false \
+            --set harbor.harborAdminPassword=ci \
+            --set harbor.externalURL=https://harbor.example.com \
+            -f examples/bootstrap-values.yaml \
+            > /tmp/bootstrap-external.yaml
+          kubeconform -strict -ignore-missing-schemas -summary /tmp/bootstrap-external.yaml
 
       - name: Validate pack-metadata.yaml
         run: |

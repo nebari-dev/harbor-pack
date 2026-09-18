@@ -129,6 +129,25 @@ Usage: {{ include "harbor-pack.sh-literal" $value }}
 {{- end }}
 
 {{/*
+Registry host recorded in the robot Secrets: the host[:port] part of
+harbor.externalURL, with the scheme and any path stripped, so a consumer can
+build a docker-style auth entry without a second lookup.
+
+Falls back to the in-cluster Harbor front Service (host:port) when
+harbor.externalURL is unset - usable only from inside the cluster and only over
+plain HTTP, so the robots Job prints a warning in that case.
+*/}}
+{{- define "harbor-pack.registry-host" -}}
+{{- $ext := .Values.harbor.externalURL | default "" -}}
+{{- if $ext -}}
+{{- $hostPath := regexReplaceAll "^[A-Za-z][A-Za-z0-9+.-]*://" $ext "" -}}
+{{- (splitList "/" $hostPath) | first -}}
+{{- else -}}
+{{- printf "%s:%s" (include "harbor-pack.harbor-service-name" .) (include "harbor-pack.harbor-service-port" .) -}}
+{{- end -}}
+{{- end }}
+
+{{/*
 Secret created by the nebari-operator holding the provisioned OIDC client
 credentials: <nebariapp-fullname>-oidc-client (keys client-id, client-secret,
 issuer-url).
