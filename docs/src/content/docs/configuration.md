@@ -221,6 +221,8 @@ harbor:
 | `oidcSetup.adminGroup` | `""` | Keycloak group mapped to Harbor system-admin. |
 | `oidcSetup.autoOnboard` | `true` | Auto-create Harbor users on first OIDC login. |
 | `oidcSetup.image` | `curlimages/curl:8.11.0` | Image used by the config Job. |
+| `oidcSetup.projectCreationRestriction` | `adminonly` | Who may create projects: `adminonly`, `everyone`, or `""` to leave Harbor's setting alone. |
+| `oidcSetup.systemConfig` | `{}` | Extra Harbor system settings (config-API keys) merged into the same configuration call. |
 | `bootstrap.enabled` | `false` | Run the Job that creates `bootstrap.projects` in Harbor. |
 | `bootstrap.image` | `""` | Job image; defaults to `oidcSetup.image`. |
 | `bootstrap.projects` | `[]` | Projects to create (see [above](#declarative-projects)). |
@@ -240,6 +242,35 @@ harbor:
 | `bootstrap.robots[].secret.namespace` | `""` | Defaults to the release namespace; another namespace also renders a Role/RoleBinding there. |
 | `harbor.externalURL` | — | Set to `https://<hostname>`. |
 | `harbor.harborAdminPassword` | — | Admin password; supply at install time. |
+
+## Harbor system settings
+
+Harbor keeps settings such as `project_creation_restriction` in its database, not in Helm
+values, so the OIDC config Job writes them with the same `PUT /api/v2.0/configurations` call
+it uses for auth. Two values feed that payload:
+
+```yaml
+oidcSetup:
+  # adminonly | everyone | "" (leave Harbor's current setting alone)
+  projectCreationRestriction: adminonly
+  systemConfig:
+    robot_name_prefix: "robot$"
+    robot_token_duration: 30             # days
+    audit_log_forward_endpoint: "syslog://logger:5140"
+```
+
+`systemConfig` keys are Harbor config-API names and values keep their YAML type (numbers and
+booleans are sent unquoted, strings quoted), so new settings need no chart change. Settings
+with security implications keep an explicit value of their own: `auth_mode`, the `oidc_*`
+settings, and `project_creation_restriction` are rejected in `systemConfig` (the render fails
+naming the key) so they cannot silently override the chart-managed values.
+
+With `oidcSetup.autoOnboard` enabled, everyone who can log in through Keycloak gets a Harbor
+account, so the pack defaults `projectCreationRestriction` to `adminonly`. Harbor's own
+default is `everyone`, so **upgrading an existing SSO install changes behaviour**: onboarded
+users who could previously create projects no longer can. Set it to `everyone` to keep the
+old behaviour, or to `""` to stop managing the setting entirely. Standalone installs
+(`oidcSetup.enabled=false`) never run the Job and are unaffected.
 
 See the [NebariApp CRD reference](/nebariapp-crd-reference/) for the full set of NebariApp
 fields.
