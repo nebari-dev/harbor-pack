@@ -173,5 +173,9 @@ auto-create projects on publish.
 
 ## Related
 
+If the client is a workload running in the same cluster as Harbor, see
+[Consuming the Registry In-Cluster](/in-cluster-consumers/) — the Service to use, the token realm,
+and which artifacts get scanned all differ there.
+
 For OIDC and gateway details, see [Authentication](/authentication/); for storage and
 pack-specific values, see [Configuration](/configuration/).

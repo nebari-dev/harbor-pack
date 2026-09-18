@@ -42,6 +42,7 @@ export default defineConfig({
             { label: 'Local Development', link: '/local-development/' },
             { label: 'Authentication', link: '/authentication/' },
             { label: 'Registry Setup', link: '/registry-setup/' },
+            { label: 'In-Cluster Consumers', link: '/in-cluster-consumers/' },
             { label: 'Configuration', link: '/configuration/' },
           ],
         },
