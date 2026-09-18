@@ -309,14 +309,16 @@ spec:
               {{- if .Values.bootstrap.webhooks }}
 
               # ensure_webhook <project> <policy> <endpoint> <events> <payload_format> \
-              #                <skip_cert_verify> <enabled> [auth_header]
+              #                <skip_cert_verify> <enabled> [secret_ref] [auth_header]
               #
-              # <events> is a space-separated list; <auth_header> is the raw
-              # Secret value and is never echoed. Unlike the helpers above this
-              # one updates: an existing policy with the same name is PUT with
-              # the full desired body, so changing the endpoint or the event
-              # list in values takes effect on `helm upgrade` without creating
-              # a second policy.
+              # <events> is a space-separated list. <secret_ref> is the
+              # name/key of the Secret the header came from - safe to print, and
+              # printed when that value is unusable; <auth_header> is the value
+              # itself, always the last argument, and is never echoed. Unlike
+              # the helpers above this one updates: an existing policy with the
+              # same name is PUT with the full desired body, so changing the
+              # endpoint or the event list in values takes effect on
+              # `helm upgrade` without creating a second policy.
               ensure_webhook() {
                 name="$1"
                 policy="$2"
@@ -325,7 +327,8 @@ spec:
                 fmt="$5"
                 skip="$6"
                 wh_enabled="$7"
-                auth_header="${8:-}"
+                auth_secret="${8:-}"
+                auth_header="${9:-}"
 
                 # A policy can only hang off an existing project; say so plainly
                 # rather than letting the API calls below fail obscurely.
@@ -400,6 +403,15 @@ spec:
                   # in an HTTP header, and Secret values often end with one).
                   auth_json=$(printf '%s' "$auth_header" | tr -d '\r\n' \
                     | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')
+                  # Anything else in the C0 range - a tab, most often - would
+                  # need a JSON escape this script deliberately does not
+                  # implement, and would otherwise reach Harbor as a malformed
+                  # body and fail with an opaque 400. Say what is wrong instead,
+                  # without echoing the value.
+                  if printf '%s' "$auth_json" | grep -q '[[:cntrl:]]'; then
+                    echo "project ${name}: webhook ${policy} auth header Secret (${auth_secret}) contains unsupported control characters - use a printable value; CR/LF are stripped, anything else is rejected." >&2
+                    return 1
+                  fi
                   target=$(printf '{"type":"http","address":"%s","auth_header":"%s","skip_cert_verify":%s,"payload_format":"%s"}' \
                     "$endpoint" "$auth_json" "$skip" "$fmt")
                 else
@@ -412,8 +424,15 @@ spec:
                 printf '{"name":"%s","enabled":%s,"event_types":[%s],"targets":[%s]}' \
                   "$policy" "$wh_enabled" "$event_json" "$target" > /tmp/webhook.json
 
+                # These two are the only requests carrying the auth header, and
+                # Harbor quotes the offending request back in some error bodies.
+                # Redacting that is not something a regex can be trusted with -
+                # an escaped quote inside the value ends the match early and
+                # leaks the rest - so the body is simply never read: -o
+                # /dev/null, and failures report the status only. Harbor's core
+                # logs have the detail if a 4xx needs chasing.
                 if [ -n "$id" ]; then
-                  status=$(curl -s -o /tmp/resp.txt -w '%{http_code}' -u "$AUTH" \
+                  status=$(curl -s -o /dev/null -w '%{http_code}' -u "$AUTH" \
                     -X PUT "${HARBOR_API}/projects/${name}/webhook/policies/${id}" \
                     -H "$NAME_HDR" \
                     -H "Content-Type: application/json" \
@@ -422,14 +441,12 @@ spec:
                   case "$status" in
                     200|204) echo "project ${name}: webhook ${policy} updated (id ${id}, events ${events})" ;;
                     *)
-                      echo "project ${name}: webhook ${policy} update failed (HTTP ${status}):" >&2
-                      # Redact the header in case Harbor echoes the request back.
-                      sed 's/"auth_header":"[^"]*"/"auth_header":"***"/g' /tmp/resp.txt >&2
+                      echo "project ${name}: webhook ${policy} (id ${id}) update failed (HTTP ${status}); response body suppressed because Harbor may echo the auth header back - see the harbor-core logs." >&2
                       return 1
                       ;;
                   esac
                 else
-                  status=$(curl -s -o /tmp/resp.txt -w '%{http_code}' -u "$AUTH" \
+                  status=$(curl -s -o /dev/null -w '%{http_code}' -u "$AUTH" \
                     -X POST "${HARBOR_API}/projects/${name}/webhook/policies" \
                     -H "$NAME_HDR" \
                     -H "Content-Type: application/json" \
@@ -445,8 +462,7 @@ spec:
                       return 1
                       ;;
                     *)
-                      echo "project ${name}: webhook ${policy} create failed (HTTP ${status}):" >&2
-                      sed 's/"auth_header":"[^"]*"/"auth_header":"***"/g' /tmp/resp.txt >&2
+                      echo "project ${name}: webhook ${policy} create failed (HTTP ${status}); response body suppressed because Harbor may echo the auth header back - see the harbor-core logs." >&2
                       return 1
                       ;;
                   esac
@@ -500,7 +516,13 @@ spec:
               {{- $skip := ternary "true" "false" (default false $webhook.skipCertVerify) }}
               {{- $wEnabled := "true" }}
               {{- if hasKey $webhook "enabled" }}{{- $wEnabled = ternary "true" "false" $webhook.enabled }}{{- end }}
-              ensure_webhook {{ include "harbor-pack.sh-literal" $wProject }} {{ include "harbor-pack.sh-literal" $wName }} {{ include "harbor-pack.sh-literal" $endpoint }} {{ include "harbor-pack.sh-literal" (join " " $events) }} '{{ $format }}' '{{ $skip }}' '{{ $wEnabled }}' {{ if $webhook.authHeader }}"${WEBHOOK_AUTH_{{ $i }}}"{{ else }}''{{ end }}
+              {{- /*
+                The Secret's name/key, not its contents - printed if the value
+                turns out to be unusable, so the operator knows where to look.
+              */}}
+              {{- $secretRef := "" }}
+              {{- with $webhook.authHeader }}{{- $secretRef = printf "%s/%s" .secretName .secretKey }}{{- end }}
+              ensure_webhook {{ include "harbor-pack.sh-literal" $wProject }} {{ include "harbor-pack.sh-literal" $wName }} {{ include "harbor-pack.sh-literal" $endpoint }} {{ include "harbor-pack.sh-literal" (join " " $events) }} '{{ $format }}' '{{ $skip }}' '{{ $wEnabled }}' {{ include "harbor-pack.sh-literal" $secretRef }} {{ if $webhook.authHeader }}"${WEBHOOK_AUTH_{{ $i }}}"{{ else }}''{{ end }}
               {{- end }}
 
               echo "Harbor project bootstrap complete."

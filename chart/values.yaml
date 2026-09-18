@@ -143,7 +143,8 @@ bootstrap:
   #     payloadFormat: Default    # Default | CloudEvents
   #     # Optional: sent verbatim as the Authorization header. The value comes
   #     # only from this Secret, which must exist in the release namespace - it
-  #     # is never read from values and is never logged.
+  #     # is never read from values and is never logged. It must be printable:
+  #     # a trailing CR/LF is stripped, any other control character is rejected.
   #     authHeader:
   #       secretName: harbor-webhook-cog-index
   #       secretKey: authorization
