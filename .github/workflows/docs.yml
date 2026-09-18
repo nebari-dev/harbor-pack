@@ -21,6 +21,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+        with: { fetch-depth: 0 } # lastUpdated needs full git history
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
