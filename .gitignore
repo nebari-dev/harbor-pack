@@ -12,3 +12,6 @@ docs/site/.astro/
 
 # OS
 .DS_Store
+
+# Wrangler CLI cache (local docs deploys)
+.wrangler/
