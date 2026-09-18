@@ -4,7 +4,44 @@ description: Storage backends, external database/Redis, and the pack-specific va
 ---
 
 Everything under the `harbor:` key in `values.yaml` is passed straight to the upstream Harbor
-chart. The pack adds `nebariapp.*` and `oidcSetup.*`.
+chart. The pack adds `nebariapp.*`, `oidcSetup.*` and `bootstrap.*`.
+
+## Declarative projects
+
+Harbor never auto-creates projects, so a fresh install comes up with only `library` until
+someone clicks through the UI. Declare them instead, and a post-install/upgrade Job applies
+them through Harbor's API:
+
+```yaml
+bootstrap:
+  enabled: true
+  projects:
+    - name: cogs
+      public: false
+      members:                     # optional: Keycloak (OIDC) groups → project roles
+        - group: cog-publishers
+          role: developer          # projectAdmin | maintainer | developer | guest | limitedGuest
+      immutableTags:               # optional: tag immutability rules
+        - tagPattern: "sha-*"
+          repoPattern: "**"        # defaults to ** (all repositories in the project)
+```
+
+The Job (`<release>-harbor-pack-bootstrap-projects`) runs at hook weight `10`, after the OIDC
+Job, authenticating with the same admin Secret. It is idempotent — it looks up existing
+projects, members and rules first and treats a `409 Conflict` as "already there" — so a repeat
+`helm upgrade` makes no changes. It needs no Kubernetes API access, and so works on standalone
+installs (`nebariapp.enabled: false`) as well, running as the namespace `default`
+ServiceAccount.
+
+Members are **OIDC group** bindings, so they only grant access once SSO is configured
+(see [Authentication](/authentication/)); a user picks up the role on their next login.
+
+The Job only adds missing state: it never updates or deletes existing projects, members or
+rules. Changing `public:` for a project that already exists, or removing an entry from
+`projects`, has no effect on Harbor.
+
+Follow the Job with `kubectl logs job/<release>-harbor-pack-bootstrap-projects -n <ns>`; it
+prints one line per project, member and rule.
 
 ## Storage
 
@@ -77,6 +114,15 @@ harbor:
 | `oidcSetup.adminGroup` | `""` | Keycloak group mapped to Harbor system-admin. |
 | `oidcSetup.autoOnboard` | `true` | Auto-create Harbor users on first OIDC login. |
 | `oidcSetup.image` | `curlimages/curl:8.11.0` | Image used by the config Job. |
+| `bootstrap.enabled` | `false` | Run the Job that creates `bootstrap.projects` in Harbor. |
+| `bootstrap.image` | `""` | Job image; defaults to `oidcSetup.image`. |
+| `bootstrap.projects` | `[]` | Projects to create (see [above](#declarative-projects)). |
+| `bootstrap.projects[].name` | — | Required; Harbor project name. |
+| `bootstrap.projects[].public` | `false` | Project visibility. |
+| `bootstrap.projects[].members[].group` | — | Keycloak/OIDC group name. |
+| `bootstrap.projects[].members[].role` | — | `projectAdmin`, `maintainer`, `developer`, `guest`, or `limitedGuest`. |
+| `bootstrap.projects[].immutableTags[].tagPattern` | — | Doublestar tag pattern made immutable. |
+| `bootstrap.projects[].immutableTags[].repoPattern` | `**` | Repositories the rule applies to. |
 | `harbor.externalURL` | — | Set to `https://<hostname>`. |
 | `harbor.harborAdminPassword` | — | Admin password; supply at install time. |
 

@@ -99,6 +99,21 @@ core Secret (<harbor-fullname>-core) under key HARBOR_ADMIN_PASSWORD.
 {{- end }}
 
 {{/*
+Render a values-supplied string as a single-quoted /bin/sh literal for the
+bootstrap Job's script, so project/group/pattern values cannot be re-split or
+expanded by the shell. Characters that would corrupt the hand-assembled JSON
+payloads (the job image has no jq) are rejected at template time.
+Usage: {{ include "harbor-pack.sh-literal" $value }}
+*/}}
+{{- define "harbor-pack.sh-literal" -}}
+{{- $v := toString . -}}
+{{- if or (contains "\"" $v) (contains "\\" $v) -}}
+{{- fail (printf "bootstrap: value %q must not contain double quotes or backslashes" $v) -}}
+{{- end -}}
+{{- printf "'%s'" (replace "'" "'\\''" $v) -}}
+{{- end }}
+
+{{/*
 Secret created by the nebari-operator holding the provisioned OIDC client
 credentials: <nebariapp-fullname>-oidc-client (keys client-id, client-secret,
 issuer-url).

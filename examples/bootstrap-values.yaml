@@ -1,0 +1,24 @@
+# Declarative Harbor projects, applied by the post-install bootstrap Job.
+#
+#   helm install harbor . -n harbor --create-namespace \
+#     -f standalone-values.yaml -f bootstrap-values.yaml
+#
+# The Job is idempotent: existing projects, members and rules are left alone,
+# so re-running `helm upgrade` changes nothing. Members map Keycloak (OIDC)
+# groups to Harbor project roles and therefore need OIDC auth configured.
+
+bootstrap:
+  enabled: true
+  projects:
+    - name: cogs
+      public: false
+      members:
+        - group: cog-publishers
+          role: developer      # projectAdmin | maintainer | developer | guest | limitedGuest
+        - group: cog-readers
+          role: guest
+      immutableTags:
+        - tagPattern: "sha-*"
+          repoPattern: "**"
+    - name: shared
+      public: true

@@ -83,6 +83,30 @@ oidcSetup:
   adminPasswordKey: HARBOR_ADMIN_PASSWORD
 
 # =============================================================================
+# Harbor project bootstrap Job
+# =============================================================================
+# Harbor never auto-creates projects, and projects (with their members and tag
+# immutability rules) live in Harbor's database, not in Helm values. This
+# post-install/upgrade hook Job applies the declarations below through Harbor's
+# REST API after the OIDC Job (hook weight 10 vs 5). It is idempotent - a repeat
+# `helm upgrade` is a no-op - and works with nebariapp.enabled: false too.
+bootstrap:
+  enabled: false
+  image: ""   # Defaults to oidcSetup.image (curl + /bin/sh is all it needs).
+  projects: []
+  # projects:
+  #   - name: cogs
+  #     public: false
+  #     # Optional: map Keycloak groups (OIDC group members) to project roles.
+  #     members:
+  #       - group: cog-publishers
+  #         role: developer      # projectAdmin | maintainer | developer | guest | limitedGuest
+  #     # Optional: tag immutability rules for the project.
+  #     immutableTags:
+  #       - tagPattern: "sha-*"
+  #         repoPattern: "**"
+
+# =============================================================================
 # Harbor (upstream subchart) overrides
 # =============================================================================
 # Everything under `harbor:` is passed to the upstream Harbor chart.
