@@ -1,11 +1,17 @@
 {{/*
   Harbor project bootstrap Job
   ---------------------------
-  Harbor never auto-creates projects, and projects (plus their members and tag
-  immutability rules) are DB-resident state that Helm values cannot set - they
-  only exist through Harbor's REST API. This post-install/upgrade hook applies
-  `bootstrap.projects[]` with curl, so a fresh install or a GitOps re-deploy
+  Harbor never auto-creates projects, and projects (plus their members, tag
+  immutability rules and webhook policies) are DB-resident state that Helm
+  values cannot set - they only exist through Harbor's REST API. This
+  post-install/upgrade hook applies `bootstrap.projects[]` and
+  `bootstrap.webhooks[]` with curl, so a fresh install or a GitOps re-deploy
   onto a new cluster comes up with the expected projects already present.
+
+  Webhooks run in this same Job, after the projects, for two reasons: a policy
+  can only be attached to an existing project, and the auth header each policy
+  sends comes from a Kubernetes Secret that the kubelet injects into this
+  container as WEBHOOK_AUTH_<index> - no Kubernetes API access required.
 
   Runs at hook weight 10, i.e. after the OIDC config Job (weight 5), so group
   members resolve against an already OIDC-enabled Harbor.
@@ -22,6 +28,11 @@
   immutable tag rules there is none - Harbor inserts an equivalent rule without
   comparing selectors - so that lookup is exact and gives up loudly rather than
   guessing (see ensure_immutable_rule).
+
+  Webhook policies go one step further: they are matched by (project, name) and
+  PUT with the full desired body when they already exist, so endpoint/event
+  changes in values propagate on upgrade instead of being ignored. Their lookup
+  is the only guard too - a 409 there means the lookup missed, and is fatal.
 
   Shell safety: values are rendered as single-quoted /bin/sh literals by
   `harbor-pack.sh-literal`, which rejects quotes/backslashes/control characters
@@ -74,6 +85,21 @@ spec:
                 secretKeyRef:
                   name: {{ include "harbor-pack.admin-secret-name" . }}
                   key: {{ .Values.oidcSetup.adminPasswordKey | quote }}
+            {{- /*
+              One env var per webhook that declares an authHeader, named after
+              the entry's index in bootstrap.webhooks. The kubelet reads the
+              Secret, so the Job needs no RBAC; the value is only ever written
+              into the request body, never logged.
+            */}}
+            {{- range $i, $webhook := .Values.bootstrap.webhooks }}
+            {{- with $webhook.authHeader }}
+            - name: WEBHOOK_AUTH_{{ $i }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ required "bootstrap.webhooks[].authHeader.secretName is required" .secretName | quote }}
+                  key: {{ required "bootstrap.webhooks[].authHeader.secretKey is required" .secretKey | quote }}
+            {{- end }}
+            {{- end }}
           command:
             - /bin/sh
             - -c
@@ -280,6 +306,169 @@ spec:
                     ;;
                 esac
               }
+              {{- if .Values.bootstrap.webhooks }}
+
+              # ensure_webhook <project> <policy> <endpoint> <events> <payload_format> \
+              #                <skip_cert_verify> <enabled> [secret_ref] [auth_header]
+              #
+              # <events> is a space-separated list. <secret_ref> is the
+              # name/key of the Secret the header came from - safe to print, and
+              # printed when that value is unusable; <auth_header> is the value
+              # itself, always the last argument, and is never echoed. Unlike
+              # the helpers above this one updates: an existing policy with the
+              # same name is PUT with the full desired body, so changing the
+              # endpoint or the event list in values takes effect on
+              # `helm upgrade` without creating a second policy.
+              ensure_webhook() {
+                name="$1"
+                policy="$2"
+                endpoint="$3"
+                events="$4"
+                fmt="$5"
+                skip="$6"
+                wh_enabled="$7"
+                auth_secret="${8:-}"
+                auth_header="${9:-}"
+
+                # A policy can only hang off an existing project; say so plainly
+                # rather than letting the API calls below fail obscurely.
+                status=$(curl -s -I -o /dev/null -w '%{http_code}' -u "$AUTH" \
+                  "${HARBOR_API}/projects?project_name=${name}")
+                if [ "$status" != "200" ]; then
+                  echo "webhook ${policy}: project ${name} does not exist - add it to bootstrap.projects or create it before this webhook." >&2
+                  return 1
+                fi
+
+                # Ask this Harbor which event types it supports, so a typo in
+                # values fails here with the valid set instead of quietly
+                # producing a policy that never fires. Not a fetch_page call:
+                # this endpoint returns a single object, not a paged array, so
+                # there is nothing to split or bound.
+                status=$(curl -s -o /tmp/events.json -w '%{http_code}' -u "$AUTH" -H "$NAME_HDR" \
+                  "${HARBOR_API}/projects/${name}/webhook/events")
+                if [ "$status" != "200" ]; then
+                  echo "project ${name}: cannot list supported webhook events (HTTP ${status}):" >&2
+                  cat /tmp/events.json >&2
+                  return 1
+                fi
+                # {"event_type":["PUSH_ARTIFACT",...],"notify_type":[...],...}
+                # Fall back to the whole body if a future Harbor reshapes this.
+                supported=$(sed -n 's/.*"event_type":\[\([^]]*\)\].*/\1/p' /tmp/events.json)
+                if [ -z "$supported" ]; then
+                  supported=$(cat /tmp/events.json)
+                fi
+
+                event_json=""
+                for event in $events; do
+                  if ! printf '%s' "$supported" | grep -qF "\"${event}\""; then
+                    echo "project ${name}: webhook ${policy} requests event type ${event}, which this Harbor does not support." >&2
+                    echo "  supported event types: ${supported}" >&2
+                    return 1
+                  fi
+                  if [ -z "$event_json" ]; then
+                    event_json="\"${event}\""
+                  else
+                    event_json="${event_json},\"${event}\""
+                  fi
+                done
+
+                # Find an existing policy by name. Like the immutable rules this
+                # lookup is the only guard against a duplicate - a 409 below
+                # means it missed - so it fails loudly rather than guessing, and
+                # fetch_page bounds it by X-Total-Count (the endpoint pages at
+                # 10 by default, hence page_size).
+                fetch_page "project ${name}: webhook policies" /tmp/policies.txt \
+                  "${HARBOR_API}/projects/${name}/webhook/policies?page_size=${PAGE_SIZE}"
+                # The exact "name":"<policy>" pair, closing quote included, so a
+                # policy whose name merely starts with this one cannot match.
+                line=$(grep -F "\"name\":\"${policy}\"" /tmp/policies.txt | head -n 1)
+                id=""
+                if [ -n "$line" ]; then
+                  # Read the id off that line without assuming it comes first:
+                  # split the line into comma-separated fields and take the
+                  # first that opens with an "id" KEY. An unescaped " can only
+                  # start a key - Harbor escapes quotes inside values as \" -
+                  # and "project_id" does not match because the byte before id
+                  # must be the quote itself.
+                  id=$(printf '%s\n' "$line" | tr ',' '\n' \
+                    | sed -n 's/^[^"]*"id":\([0-9][0-9]*\).*/\1/p' | head -n 1)
+                  if [ -z "$id" ]; then
+                    echo "project ${name}: found a webhook policy named ${policy} but could not read its id - refusing to risk a duplicate; reconcile it manually." >&2
+                    return 1
+                  fi
+                fi
+
+                if [ -n "$auth_header" ]; then
+                  # Escape the Secret value for JSON and drop any CR/LF (illegal
+                  # in an HTTP header, and Secret values often end with one).
+                  auth_json=$(printf '%s' "$auth_header" | tr -d '\r\n' \
+                    | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')
+                  # Anything else in the C0 range - a tab, most often - would
+                  # need a JSON escape this script deliberately does not
+                  # implement, and would otherwise reach Harbor as a malformed
+                  # body and fail with an opaque 400. Say what is wrong instead,
+                  # without echoing the value.
+                  if printf '%s' "$auth_json" | grep -q '[[:cntrl:]]'; then
+                    echo "project ${name}: webhook ${policy} auth header Secret (${auth_secret}) contains unsupported control characters - use a printable value; CR/LF are stripped, anything else is rejected." >&2
+                    return 1
+                  fi
+                  target=$(printf '{"type":"http","address":"%s","auth_header":"%s","skip_cert_verify":%s,"payload_format":"%s"}' \
+                    "$endpoint" "$auth_json" "$skip" "$fmt")
+                else
+                  # auth_header is omitted entirely when unset.
+                  target=$(printf '{"type":"http","address":"%s","skip_cert_verify":%s,"payload_format":"%s"}' \
+                    "$endpoint" "$skip" "$fmt")
+                fi
+                # Written to a file instead of curl's command line so the auth
+                # header never shows up in the container's process list.
+                printf '{"name":"%s","enabled":%s,"event_types":[%s],"targets":[%s]}' \
+                  "$policy" "$wh_enabled" "$event_json" "$target" > /tmp/webhook.json
+
+                # These two are the only requests carrying the auth header, and
+                # Harbor quotes the offending request back in some error bodies.
+                # Redacting that is not something a regex can be trusted with -
+                # an escaped quote inside the value ends the match early and
+                # leaks the rest - so the body is simply never read: -o
+                # /dev/null, and failures report the status only. Harbor's core
+                # logs have the detail if a 4xx needs chasing.
+                if [ -n "$id" ]; then
+                  status=$(curl -s -o /dev/null -w '%{http_code}' -u "$AUTH" \
+                    -X PUT "${HARBOR_API}/projects/${name}/webhook/policies/${id}" \
+                    -H "$NAME_HDR" \
+                    -H "Content-Type: application/json" \
+                    -d @/tmp/webhook.json)
+                  rm -f /tmp/webhook.json
+                  case "$status" in
+                    200|204) echo "project ${name}: webhook ${policy} updated (id ${id}, events ${events})" ;;
+                    *)
+                      echo "project ${name}: webhook ${policy} (id ${id}) update failed (HTTP ${status}); response body suppressed because Harbor may echo the auth header back - see the harbor-core logs." >&2
+                      return 1
+                      ;;
+                  esac
+                else
+                  status=$(curl -s -o /dev/null -w '%{http_code}' -u "$AUTH" \
+                    -X POST "${HARBOR_API}/projects/${name}/webhook/policies" \
+                    -H "$NAME_HDR" \
+                    -H "Content-Type: application/json" \
+                    -d @/tmp/webhook.json)
+                  rm -f /tmp/webhook.json
+                  case "$status" in
+                    201) echo "project ${name}: webhook ${policy} created (events ${events})" ;;
+                    409)
+                      # The lookup above missed a policy that Harbor says is
+                      # there. Fail instead of skipping, which would leave the
+                      # policy stale forever.
+                      echo "project ${name}: webhook ${policy} already exists but was not found in the policy list; refusing to continue." >&2
+                      return 1
+                      ;;
+                    *)
+                      echo "project ${name}: webhook ${policy} create failed (HTTP ${status}); response body suppressed because Harbor may echo the auth header back - see the harbor-core logs." >&2
+                      return 1
+                      ;;
+                  esac
+                fi
+              }
+              {{- end }}
               {{ range $project := .Values.bootstrap.projects }}
               {{- $name := required "bootstrap.projects[].name is required" $project.name }}
               {{- $public := ternary "true" "false" (default false $project.public) }}
@@ -299,6 +488,43 @@ spec:
               ensure_immutable_rule {{ include "harbor-pack.sh-literal" $name }} {{ include "harbor-pack.sh-literal" $tagPattern }} {{ include "harbor-pack.sh-literal" $repoPattern }}
               {{- end }}
               {{ end }}
+              {{- range $i, $webhook := .Values.bootstrap.webhooks }}
+              {{- $wProject := required "bootstrap.webhooks[].project is required" $webhook.project }}
+              {{- $wName := required "bootstrap.webhooks[].name is required" $webhook.name }}
+              {{- $endpoint := required "bootstrap.webhooks[].endpoint is required" $webhook.endpoint }}
+              {{- if not (or (hasPrefix "http://" $endpoint) (hasPrefix "https://" $endpoint)) }}
+              {{- fail (printf "bootstrap: webhook %q endpoint %q must be an http:// or https:// URL" $wName $endpoint) }}
+              {{- end }}
+              {{- $events := default (list) $webhook.events }}
+              {{- if not $events }}
+              {{- fail (printf "bootstrap: webhook %q needs at least one entry in events" $wName) }}
+              {{- end }}
+              {{- range $event := $events }}
+              {{- /*
+                Shape only - Harbor's own /webhook/events list is the authority
+                and is checked at run time. This just keeps a malformed value
+                from being packed into the space-separated events argument.
+              */}}
+              {{- if not (regexMatch "^[A-Z][A-Z0-9_]*$" (toString $event)) }}
+              {{- fail (printf "bootstrap: webhook %q has invalid event type %q (expected an upper-case Harbor event type such as PUSH_ARTIFACT)" $wName (toString $event)) }}
+              {{- end }}
+              {{- end }}
+              {{- $format := default "Default" $webhook.payloadFormat }}
+              {{- if not (has $format (list "Default" "CloudEvents")) }}
+              {{- fail (printf "bootstrap: webhook %q has unknown payloadFormat %q (expected Default or CloudEvents)" $wName $format) }}
+              {{- end }}
+              {{- $skip := ternary "true" "false" (default false $webhook.skipCertVerify) }}
+              {{- $wEnabled := "true" }}
+              {{- if hasKey $webhook "enabled" }}{{- $wEnabled = ternary "true" "false" $webhook.enabled }}{{- end }}
+              {{- /*
+                The Secret's name/key, not its contents - printed if the value
+                turns out to be unusable, so the operator knows where to look.
+              */}}
+              {{- $secretRef := "" }}
+              {{- with $webhook.authHeader }}{{- $secretRef = printf "%s/%s" .secretName .secretKey }}{{- end }}
+              ensure_webhook {{ include "harbor-pack.sh-literal" $wProject }} {{ include "harbor-pack.sh-literal" $wName }} {{ include "harbor-pack.sh-literal" $endpoint }} {{ include "harbor-pack.sh-literal" (join " " $events) }} '{{ $format }}' '{{ $skip }}' '{{ $wEnabled }}' {{ include "harbor-pack.sh-literal" $secretRef }} {{ if $webhook.authHeader }}"${WEBHOOK_AUTH_{{ $i }}}"{{ else }}''{{ end }}
+              {{- end }}
+
               echo "Harbor project bootstrap complete."
           volumeMounts:
             - name: tmp
