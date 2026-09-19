@@ -18,6 +18,7 @@ chart and adds Nebari integration: gateway routing, a landing-page card, and **K
 | Routing / TLS | A `NebariApp` CR points the nebari-operator at Harbor's nginx front Service; the shared gateway terminates TLS and routes to it. |
 | Landing card | `NebariApp.spec.landingPage` renders a Harbor card on the Nebari landing page. |
 | **SSO** | The operator provisions a Keycloak OIDC client + Secret; a post-install Job switches Harbor into `oidc_auth` mode using those credentials. See [Authentication](#authentication). |
+| Projects | `bootstrap.projects[]` declares projects, group roles, and tag immutability rules; an idempotent post-install Job applies them. See [Declarative projects](#declarative-projects). |
 | Storage | Bundled Postgres/Redis + filesystem registry storage by default; toggles for S3/MinIO object storage and external managed Postgres/Redis. |
 
 ## Prerequisites
@@ -172,6 +173,45 @@ docker tag alpine harbor.nebari.example.com/library/alpine:latest
 docker push harbor.nebari.example.com/library/alpine:latest
 ```
 
+## Declarative projects
+
+Harbor never auto-creates projects, so a fresh install (or a re-deploy onto a new cluster)
+otherwise comes up with only `library`. Declare them in values and a post-install Job applies
+them through Harbor's API — see [`examples/bootstrap-values.yaml`](examples/bootstrap-values.yaml):
+
+```yaml
+bootstrap:
+  enabled: true
+  projects:
+    - name: cogs
+      public: false
+      members:                     # optional: Keycloak (OIDC) groups → project roles
+        - group: cog-publishers
+          role: developer          # projectAdmin | maintainer | developer | guest | limitedGuest
+      immutableTags:               # optional: tag immutability rules
+        - tagPattern: "sha-*"
+          repoPattern: "**"
+```
+
+The `harbor-harbor-pack-bootstrap-projects` Job runs after the OIDC Job (hook weight `10` vs
+`5`) using the same admin Secret, and is idempotent: it looks each item up before creating it,
+so repeat `helm upgrade`s make no changes. Duplicate projects and members are impossible
+(Harbor answers `409 Conflict` if the lookup ever misses); immutable tag rules have no such
+server-side guard — Harbor inserts an equivalent rule without comparing selectors — so the Job
+matches the tag pattern against the rule's `tag_selectors` and the repo pattern against its
+`scope_selectors`. It reads one page of each listing and checks `X-Total-Count`, so if a
+project has more members or rules than fit (100, Harbor's maximum page size) the Job fails and
+says so instead of acting on a truncated list.
+
+It also works with `nebariapp.enabled: false` (standalone installs need projects too), where it
+runs as the namespace `default` ServiceAccount — the Job talks only to Harbor's API and needs
+no Kubernetes permissions.
+
+Group members map **OIDC groups** (`group_type: 3`), so they take effect once SSO is
+configured; Keycloak group members get the role on their next login. Names, groups and
+patterns are rendered into the Job's script as quoted literals; `helm template` fails if one
+contains a double quote, backslash or control character.
+
 ## Storage & backing services
 
 Defaults are bundled (Harbor's in-chart Postgres/Redis on PVCs, filesystem registry storage)
@@ -200,6 +240,15 @@ and [`examples/nebari-values.yaml`](examples/nebari-values.yaml):
 | `oidcSetup.autoOnboard` | `true` | Auto-create Harbor users on first OIDC login. |
 | `oidcSetup.projectCreationRestriction` | `adminonly` | Who may create projects: `adminonly`, `everyone`, or `""` to leave Harbor's setting alone. |
 | `oidcSetup.systemConfig` | `{}` | Extra Harbor system settings (config-API keys) merged into the same configuration call. |
+| `bootstrap.enabled` | `false` | Run the Job that creates `bootstrap.projects` in Harbor. |
+| `bootstrap.image` | `""` | Job image; defaults to `oidcSetup.image`. |
+| `bootstrap.projects` | `[]` | Projects to create (see [Declarative projects](#declarative-projects)). |
+| `bootstrap.projects[].name` | — | Required; Harbor project name. |
+| `bootstrap.projects[].public` | `false` | Project visibility. |
+| `bootstrap.projects[].members[].group` | — | Keycloak/OIDC group name. |
+| `bootstrap.projects[].members[].role` | — | `projectAdmin`, `maintainer`, `developer`, `guest`, or `limitedGuest`. |
+| `bootstrap.projects[].immutableTags[].tagPattern` | — | Doublestar tag pattern made immutable. |
+| `bootstrap.projects[].immutableTags[].repoPattern` | `**` | Repositories the rule applies to. |
 | `harbor.*` | — | Passed to the upstream Harbor chart. |
 
 ## Troubleshooting
@@ -210,6 +259,9 @@ and [`examples/nebari-values.yaml`](examples/nebari-values.yaml):
   `kubectl logs job/harbor-harbor-pack-oidc-setup -n <ns>`. Common causes: the OIDC Secret
   not yet created by the operator (Job retries via `backoffLimit`), or a wrong admin password
   (`HARBOR_ADMIN_PASSWORD` must match `harbor.harborAdminPassword`).
+- **Projects missing after install** — check the bootstrap Job:
+  `kubectl logs job/harbor-harbor-pack-bootstrap-projects -n <ns>`. It logs one line per
+  project/member/rule; a non-2xx response is printed with Harbor's error body.
 - **"Login via OIDC Provider" missing** — the Job didn't complete; confirm
   `GET /api/v2.0/configurations` shows `auth_mode=oidc_auth`.
 - **`docker login` fails** — use a **CLI secret** or robot account, not your Keycloak
@@ -221,7 +273,10 @@ and [`examples/nebari-values.yaml`](examples/nebari-values.yaml):
 
 - Object storage and external Postgres/Redis are exposed via values but exercised only via
   `helm template` in CI (integration tests use bundled filesystem/Postgres/Redis).
-- No automated Harbor→Keycloak group→project role mapping beyond `oidc_admin_group`.
+- `bootstrap.projects` applies missing state only: it creates projects, group members and
+  immutability rules, but does not update or remove ones that already exist (changing
+  `public:` for an existing project, or deleting an entry, has no effect). Robot accounts and
+  webhook policies are not covered yet.
 - Upgrades follow upstream Harbor's chart; review upstream release notes before major bumps.
 
 ## License
