@@ -230,27 +230,32 @@ spec:
                   return 1
                 fi
                 while IFS= read -r rule; do
-                  # Compare the tag pattern only against the tag_selectors half
-                  # of THIS rule and the repo pattern only against its
-                  # scope_selectors half, so a pattern cannot match the wrong
-                  # selector, the wrong rule, or both greps at once. The split
-                  # key keeps its colon so that a pattern whose value is
-                  # literally scope_selectors is not mistaken for the delimiter
+                  # Extract each selector section BY KEY, terminated by the
+                  # other key (or end of object), so the comparison does not
+                  # depend on field order. The list endpoint returns go-swagger
+                  # generated models (ToSwagger in the immutable handler), which
+                  # marshal fields alphabetically - scope_selectors BEFORE
+                  # tag_selectors - unlike the pkg model's declaration order.
+                  # The key keeps its quotes and colon so a pattern whose value
+                  # merely mentions a key name cannot act as the delimiter
                   # (ending the key needs a ", which our values cannot contain
-                  # and Harbor escapes as \" inside strings).
-                  # Residual assumption: tag_selectors precedes scope_selectors
-                  # within a rule object - Go marshals struct fields in
-                  # declaration order, and that is their order in Harbor's
-                  # ImmutableRule struct.
-                  tags=${rule%%\"scope_selectors\":*}
+                  # and Harbor escapes as \" inside strings). Terminating at the
+                  # other key rather than the first ] keeps patterns containing
+                  # ] (glob character classes) intact.
+                  tags=${rule#*\"tag_selectors\":}
+                  tags=${tags%%\"scope_selectors\":*}
                   scopes=${rule#*\"scope_selectors\":}
+                  scopes=${scopes%%\"tag_selectors\":*}
                   printf '%s' "$tags" | grep -qF "\"pattern\":\"${tag_pattern}\"" || continue
                   printf '%s' "$scopes" | grep -qF "\"pattern\":\"${repo_pattern}\"" || continue
                   # A rule only counts as "already present" if it is the rule we
                   # would create: enabled, with matches/repoMatches decorations.
                   # A disabled or excludes/repoExcludes rule with the same
                   # patterns does NOT protect these tags, so we still create.
-                  printf '%s' "$rule" | grep -qF '"disabled":false' || continue
+                  # "disabled" is omitempty in the swagger model: an enabled
+                  # rule carries NO disabled key, so test for the absence of
+                  # "disabled":true rather than the presence of "disabled":false.
+                  printf '%s' "$rule" | grep -qF '"disabled":true' && continue
                   printf '%s' "$tags" | grep -qF '"decoration":"matches"' || continue
                   printf '%s' "$scopes" | grep -qF '"decoration":"repoMatches"' || continue
                   echo "project ${name}: immutable rule ${tag_pattern} on ${repo_pattern} already present"
