@@ -125,8 +125,9 @@ as project admin, and prints the matching `nebi registry add` line.
 > **Caveat:** the operator dev stack runs Keycloak in `start-dev` (in-memory H2), so any
 > Keycloak pod restart wipes the realm — and the seeded `dev` user with it.
 > `enable-sso.sh` restarts Keycloak *before* creating the realm to avoid this; if you restart
-> Keycloak later, re-run `.cache/nebari-operator/dev/scripts/services/keycloak/setup.sh`
-> and then `make seed-user`.
+> Keycloak later, re-run
+> `CLUSTER_NAME=harbor-pack-dev .cache/nebari-operator/dev/scripts/services/keycloak/setup.sh`
+> (the operator script needs the cluster name) and then `make seed-user`.
 
 ## Authentication
 

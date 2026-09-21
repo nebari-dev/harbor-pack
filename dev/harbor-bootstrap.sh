@@ -25,6 +25,9 @@ set -euo pipefail
 
 HARBOR_NAMESPACE=${HARBOR_NAMESPACE:-harbor}
 HARBOR_SVC=${HARBOR_SVC:-harbor}   # Harbor front service (harbor.expose.clusterIP.name)
+# Pin every kubectl call to the dev cluster so a stray current-context (another
+# kind cluster, a real deployment) can never receive these privilege grants.
+KUBECTL_CONTEXT=${KUBECTL_CONTEXT:-kind-harbor-pack-dev}
 HARBOR_ADMIN=${HARBOR_ADMIN:-admin}
 HARBOR_ADMIN_PASSWORD=${HARBOR_ADMIN_PASSWORD:-Harbor12345}
 HARBOR_HOSTNAME=${HARBOR_HOSTNAME:-harbor.nebari.local}
@@ -85,7 +88,7 @@ fi
 API="http://127.0.0.1:${LOCAL_PORT}/api/v2.0"
 
 echo "==> port-forward svc/$HARBOR_SVC -n $HARBOR_NAMESPACE -> 127.0.0.1:$LOCAL_PORT"
-kubectl -n "$HARBOR_NAMESPACE" port-forward "svc/$HARBOR_SVC" "$LOCAL_PORT:80" >"$PF_LOG" 2>&1 &
+kubectl --context "$KUBECTL_CONTEXT" -n "$HARBOR_NAMESPACE" port-forward "svc/$HARBOR_SVC" "$LOCAL_PORT:80" >"$PF_LOG" 2>&1 &
 PF_PID=$!
 
 # Only proceed once OUR port-forward reports it owns the port. If the port was taken,
@@ -110,7 +113,9 @@ fi
 ready=
 for _ in $(seq 1 30); do
   kill -0 "$PF_PID" 2>/dev/null || die "port-forward died: $(cat "$PF_LOG")"
-  if curl -sf -o "$BODY" "$API/systeminfo" && grep -q 'harbor_version' "$BODY"; then
+  # /health is anonymous and returns 200 only when every component is healthy
+  # (/systeminfo omits harbor_version for unauthenticated callers, so do not grep it).
+  if curl -sf -o "$BODY" "$API/health"; then
     ready=yes
     break
   fi

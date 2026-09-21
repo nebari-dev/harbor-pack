@@ -33,13 +33,16 @@ SEED_FIRST_NAME=${SEED_FIRST_NAME:-Dev}
 SEED_LAST_NAME=${SEED_LAST_NAME:-User}
 
 KC_NAMESPACE=${KC_NAMESPACE:-keycloak}
+# Pin every kubectl call to the dev cluster so a stray current-context can never
+# have a user seeded into its Keycloak.
+KUBECTL_CONTEXT=${KUBECTL_CONTEXT:-kind-harbor-pack-dev}
 KC_SERVER=${KC_SERVER:-http://localhost:8080/auth}
 KC_ADMIN=${KC_ADMIN:-admin}
 KC_ADMIN_PASSWORD=${KC_ADMIN_PASSWORD:-admin}
 
 KC_POD=${KC_POD:-}
 if [ -z "$KC_POD" ]; then
-  KC_POD=$(kubectl get pods -n "$KC_NAMESPACE" \
+  KC_POD=$(kubectl --context "$KUBECTL_CONTEXT" get pods -n "$KC_NAMESPACE" \
     -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null \
     | grep -m1 '^keycloak' || true)
 fi
@@ -50,7 +53,7 @@ if [ -z "$KC_POD" ]; then
   exit 1
 fi
 
-kc() { kubectl exec -n "$KC_NAMESPACE" "$KC_POD" -- /opt/keycloak/bin/kcadm.sh "$@"; }
+kc() { kubectl --context "$KUBECTL_CONTEXT" exec -n "$KC_NAMESPACE" "$KC_POD" -- /opt/keycloak/bin/kcadm.sh "$@"; }
 
 echo "==> seed realm user '$SEED_USER' in realm '$REALM' (pod: $KC_POD)"
 kc config credentials --server "$KC_SERVER" --realm master \
