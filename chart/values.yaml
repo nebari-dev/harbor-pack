@@ -112,7 +112,10 @@ oidcSetup:
 # Helm values. This
 # post-install/upgrade hook Job applies the declarations below through Harbor's
 # REST API after the OIDC Job (hook weight 10 vs 5). It is idempotent - a repeat
-# `helm upgrade` is a no-op - and works with nebariapp.enabled: false too.
+# `helm upgrade` changes nothing that already matches (projects, members and
+# rules are created only when absent; an existing webhook policy is re-PUT with
+# the declared state so endpoint/event edits propagate, never duplicated) - and
+# works with nebariapp.enabled: false too.
 bootstrap:
   enabled: false
   image: ""   # Defaults to oidcSetup.image (curl + /bin/sh is all it needs).

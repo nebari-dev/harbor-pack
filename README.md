@@ -247,8 +247,9 @@ needs no Kubernetes permissions; the value is written straight into the request 
 never logged. It is kept off curl's command line, and because Harbor quotes the request back
 in some error bodies — where no redaction rule can be trusted, since a quote inside the value
 ends the match early — the Job never reads the response body of a webhook create or update at
-all: those failures report the HTTP status only, and `kubectl logs deploy/harbor-core` has the
-detail. The value must be printable: CR/LF are stripped, and any other control character (a
+all: those failures report the HTTP status only, and the harbor-core logs
+(`kubectl logs deploy/harbor-core` — for a release name that does not contain "harbor",
+`deploy/<release>-harbor-core`) have the detail. The value must be printable: CR/LF are stripped, and any other control character (a
 stray tab, say) fails the Job with a message naming the Secret, not its contents.
 
 Unlike projects, webhooks are **updated in place**: the Job matches an existing policy by
@@ -329,7 +330,8 @@ and [`examples/nebari-values.yaml`](examples/nebari-values.yaml):
   missing from the release namespace — `kubectl describe pod` shows
   `CreateContainerConfigError`. A webhook create/update that fails with a bare HTTP status
   prints no response body on purpose (Harbor may echo the auth header back); the reason is in
-  `kubectl logs deploy/harbor-core`.
+  the harbor-core logs (`deploy/harbor-core`, or `deploy/<release>-harbor-core` when the
+  release name does not contain "harbor").
 - **"Login via OIDC Provider" missing** — the Job didn't complete; confirm
   `GET /api/v2.0/configurations` shows `auth_mode=oidc_auth`.
 - **`docker login` fails** — use a **CLI secret** or robot account, not your Keycloak

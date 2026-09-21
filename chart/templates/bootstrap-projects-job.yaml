@@ -330,6 +330,14 @@ spec:
                 auth_secret="${8:-}"
                 auth_header="${9:-}"
 
+                # authHeader was declared (secret_ref is set) but the Secret key
+                # resolved to an empty string: shipping that would silently
+                # create an UNauthenticated webhook. Fail and name the Secret.
+                if [ -n "$auth_secret" ] && [ -z "$auth_header" ]; then
+                  echo "webhook ${policy}: authHeader Secret ${auth_secret} resolved to an empty value - fix the Secret or remove authHeader." >&2
+                  return 1
+                fi
+
                 # A policy can only hang off an existing project; say so plainly
                 # rather than letting the API calls below fail obscurely.
                 status=$(curl -s -I -o /dev/null -w '%{http_code}' -u "$AUTH" \

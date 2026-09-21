@@ -86,7 +86,9 @@ and is never logged: it is kept off curl's command line, and the response body o
 create or update is never read. Harbor quotes the offending request back in some error
 bodies, and redacting that reliably is not something a regular expression can do — a quote
 inside the value ends the match early and leaks the rest — so those failures report the HTTP
-status only. `kubectl logs deploy/harbor-core` has the detail when a 4xx needs chasing.
+status only. The harbor-core logs have the detail when a 4xx needs chasing
+(`kubectl logs deploy/harbor-core`; the Deployment is `<release>-harbor-core` when the
+release name does not contain "harbor").
 
 Omit `authHeader` for an endpoint that needs no credential; the `auth_header` field is then
 left out of the policy entirely.
