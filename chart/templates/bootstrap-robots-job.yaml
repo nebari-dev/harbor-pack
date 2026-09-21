@@ -157,18 +157,24 @@ spec:
               # The token goes into a 0600 curl config file rather than onto the
               # command line, where argv is readable through /proc. It is also
               # re-read per call, because kubelet rotates projected tokens.
+              # -A: kube-apiserver pretty-prints JSON for curl's default
+              # User-Agent, which would break the single-line parsing below; a
+              # non-curl agent gets compact output on every call site.
               kube() {
                 printf 'header = "Authorization: Bearer %s"\n' \
                   "$(cat "${SA_DIR}/token")" > /tmp/kube-auth.conf
-                curl -sS --cacert "${SA_DIR}/ca.crt" -K /tmp/kube-auth.conf "$@"
+                curl -sS -A harbor-pack-bootstrap --cacert "${SA_DIR}/ca.crt" \
+                  -K /tmp/kube-auth.conf "$@"
               }
 
               # api_error <file> - print just the "message" of an API error body,
               # never the body itself. Robot and Secret payloads carry secret
               # material, so unlike the projects Job this one never dumps a
               # response body, not even on failure.
+              # Whitespace-tolerant so it still works if a body ever arrives
+              # pretty-printed despite the User-Agent above.
               api_error() {
-                sed -n 's/.*"message":"\([^"]*\)".*/\1/p' "$1" >&2 || true
+                sed -n 's/.*"message"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$1" >&2 || true
               }
 
               # fetch_page <label> <out-file> <curl args...>
@@ -311,7 +317,10 @@ spec:
                     SECRET_EXISTS=yes
                     # The body carries the credential: read only the annotation
                     # out of it (| delimiter, the key contains a /) and drop it.
-                    SECRET_ROBOT_ID=$(sed -n 's|.*"harbor-pack.nebari.dev/robot-id":"\([0-9]*\)".*|\1|p' /tmp/secret-get.json)
+                    # Whitespace-tolerant: a pretty-printed body (one field per
+                    # line, space after the colon) must still yield the id -
+                    # an empty id here would rotate the robot on every run.
+                    SECRET_ROBOT_ID=$(sed -n 's|.*"harbor-pack.nebari.dev/robot-id"[[:space:]]*:[[:space:]]*"\([0-9]*\)".*|\1|p' /tmp/secret-get.json)
                     rm -f /tmp/secret-get.json
                     ;;
                   404)
