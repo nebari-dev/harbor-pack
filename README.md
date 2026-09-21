@@ -285,12 +285,18 @@ whichever Secrets are absent and leaves existing ones alone — its Role grants 
 are never logged. It runs under its own ServiceAccount/Role/RoleBinding, rendered as hooks at
 a lower weight, and does not depend on `nebariapp`.
 
+Under Helm the ServiceAccount/Role/RoleBinding are deleted once the hook event succeeds
+(`hook-delete-policy: hook-succeeded`), so `helm uninstall` leaves nothing behind. Under
+Argo CD they persist between syncs (each sync replaces them; per-resource `HookSucceeded`
+deletion there could remove the ServiceAccount before the Job pod starts) — delete the three
+`*-stable-secrets` RBAC objects by hand when retiring the app.
+
 Set `provision: false` to bring your own Secrets instead (SealedSecrets, ExternalSecrets, or
 `kubectl create secret`); the `harbor:` block is identical either way.
 
 The Job uses three small, pinned, stock images because no single stock image ships all three
 tools it needs and the containers run with a read-only root filesystem (so packages cannot be
-installed at runtime): `httpd:2.4-alpine` for bcrypt `htpasswd`, `alpine/openssl` for the key
+installed at runtime): `httpd` (2.4, tag pinned in values) for bcrypt `htpasswd`, `alpine/openssl` for the key
 pair, and `curlimages/curl` to create the Secrets through the Kubernetes API. Override them
 under `stableSecrets.images` to pull from a mirror.
 

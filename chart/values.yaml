@@ -177,7 +177,7 @@ stableSecrets:
   # containers run with a read-only root filesystem so packages cannot be added
   # at runtime. See chart/templates/stable-secrets-job.yaml for the rationale.
   images:
-    htpasswd: httpd:2.4-alpine      # bcrypt htpasswd (registry accepts nothing else)
+    htpasswd: httpd:2.4.68-alpine   # bcrypt htpasswd (registry accepts nothing else)
     openssl: alpine/openssl:3.3.2   # token-signing key pair
     apiClient: curlimages/curl:8.11.0  # creates the Secrets via the Kubernetes API
 
