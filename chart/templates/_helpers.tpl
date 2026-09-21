@@ -125,6 +125,36 @@ harbor.existingSecretAdminPasswordKey (upstream default HARBOR_ADMIN_PASSWORD).
 {{- end }}
 
 {{/*
+Render a values-supplied string as a single-quoted /bin/sh literal for the
+bootstrap Job's script, so project/group/pattern values cannot be re-split or
+expanded by the shell.
+
+Two layers of escaping are needed because two things read the script:
+  1. the kubelet expands $(VAR) references in a container's command BEFORE the
+     container starts, so every "$" is doubled ("$$" is Kubernetes' escape for
+     a literal "$"). Without this, a value like $(HARBOR_ADMIN_PASSWORD) would
+     be substituted with the admin password - which the Job then logs - and an
+     apostrophe in the substituted value would break the quoting. Doubling
+     (rather than rejecting "$") keeps names like robot$scanner usable.
+  2. /bin/sh: the value is single-quoted and any embedded ' is escaped.
+
+Characters that would corrupt the hand-assembled JSON payloads (the job image
+has no jq) or the YAML block scalar - quotes, backslashes and control
+characters - are rejected at template time.
+Usage: {{ include "harbor-pack.sh-literal" $value }}
+*/}}
+{{- define "harbor-pack.sh-literal" -}}
+{{- $v := toString . -}}
+{{- if or (contains "\"" $v) (contains "\\" $v) -}}
+{{- fail (printf "bootstrap: value %q must not contain double quotes or backslashes" $v) -}}
+{{- end -}}
+{{- if regexMatch "[[:cntrl:]]" $v -}}
+{{- fail (printf "bootstrap: value %q must not contain control characters (newline, tab, CR, ...)" $v) -}}
+{{- end -}}
+{{- printf "'%s'" (replace "$" "$$" (replace "'" "'\\''" $v)) -}}
+{{- end }}
+
+{{/*
 Secret created by the nebari-operator holding the provisioned OIDC client
 credentials: <nebariapp-fullname>-oidc-client (keys client-id, client-secret,
 issuer-url).

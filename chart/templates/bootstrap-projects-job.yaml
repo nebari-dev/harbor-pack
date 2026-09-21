@@ -1,0 +1,309 @@
+{{/*
+  Harbor project bootstrap Job
+  ---------------------------
+  Harbor never auto-creates projects, and projects (plus their members and tag
+  immutability rules) are DB-resident state that Helm values cannot set - they
+  only exist through Harbor's REST API. This post-install/upgrade hook applies
+  `bootstrap.projects[]` with curl, so a fresh install or a GitOps re-deploy
+  onto a new cluster comes up with the expected projects already present.
+
+  Runs at hook weight 10, i.e. after the OIDC config Job (weight 5), so group
+  members resolve against an already OIDC-enabled Harbor.
+
+  ServiceAccount: unlike the OIDC Job this one needs no Kubernetes API access
+  at all - it reads only the Harbor admin password, which the kubelet injects
+  from the Secret. So it uses the pack ServiceAccount when the NebariApp (and
+  therefore serviceaccount.yaml) is enabled, and the namespace `default` SA on
+  standalone installs where no pack SA is rendered.
+
+  Idempotency (the image has curl + busybox, no jq): existence is checked
+  before every create, so a repeated `helm upgrade` is a no-op. For projects
+  and members a 409 Conflict from Harbor is a second line of defence; for
+  immutable tag rules there is none - Harbor inserts an equivalent rule without
+  comparing selectors - so that lookup is exact and gives up loudly rather than
+  guessing (see ensure_immutable_rule).
+
+  Shell safety: values are rendered as single-quoted /bin/sh literals by
+  `harbor-pack.sh-literal`, which rejects quotes/backslashes/control characters
+  that would corrupt the hand-assembled JSON payloads or this YAML block, and
+  doubles "$" so the kubelet's $(VAR) expansion - which happens before /bin/sh
+  ever sees the script, and has the admin password in scope - cannot be reached
+  from values.
+*/}}
+{{- if .Values.bootstrap.enabled }}
+{{- $roleIDs := dict "projectAdmin" 1 "developer" 2 "guest" 3 "maintainer" 4 "limitedGuest" 5 }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "harbor-pack.fullname" . }}-bootstrap-projects
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "harbor-pack.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    # Higher than the OIDC Job (5) so projects are applied after auth is set up.
+    "helm.sh/hook-weight": "10"
+    "helm.sh/hook-delete-policy": before-hook-creation
+spec:
+  backoffLimit: 10
+  # Clean up automatically 10 minutes after completion (requires TTL controller).
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      labels:
+        {{- include "harbor-pack.selectorLabels" . | nindent 8 }}
+    spec:
+      restartPolicy: Never
+      serviceAccountName: {{ if .Values.nebariapp.enabled }}{{ include "harbor-pack.fullname" . }}{{ else }}default{{ end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+      containers:
+        - name: bootstrap-projects
+          image: {{ .Values.bootstrap.image | default .Values.oidcSetup.image | quote }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          env:
+            - name: HARBOR_API
+              value: "http://{{ include "harbor-pack.harbor-service-name" . }}:{{ include "harbor-pack.harbor-service-port" . }}/api/v2.0"
+            - name: HARBOR_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "harbor-pack.admin-secret-name" . }}
+                  key: {{ .Values.oidcSetup.adminPasswordKey | quote }}
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+
+              echo "Waiting for Harbor API at ${HARBOR_API} ..."
+              i=0
+              until curl -sf -o /dev/null "${HARBOR_API}/health"; do
+                i=$((i + 1))
+                if [ "$i" -ge 60 ]; then
+                  echo "Harbor API not healthy after ~5m; giving up." >&2
+                  exit 1
+                fi
+                sleep 5
+              done
+              echo "Harbor API is healthy."
+
+              # Credentials are only ever passed to curl, never echoed.
+              AUTH="admin:${HARBOR_ADMIN_PASSWORD}"
+              # Tell Harbor the {project_name_or_id} path parameter is a name.
+              NAME_HDR="X-Is-Resource-Name: true"
+              # Harbor's maximum page size. This Job reads a single page and
+              # refuses to guess if a listing is larger (see fetch_page).
+              PAGE_SIZE=100
+
+              # fetch_page <label> <out-file> <curl args...>
+              # GET one page of a Harbor list API, write it to <out-file> with
+              # one JSON object per line, and set LIST_TOTAL from the response's
+              # X-Total-Count. Fails when the result set does not fit the single
+              # page we read, rather than silently looking at a truncated list.
+              fetch_page() {
+                label="$1"
+                out="$2"
+                shift 2
+                LIST_TOTAL=""
+                status=$(curl -s -D /tmp/hdr.txt -o /tmp/page.json -w '%{http_code}' \
+                  -u "$AUTH" -H "$NAME_HDR" "$@")
+                if [ "$status" != "200" ]; then
+                  echo "${label}: listing failed (HTTP ${status}):" >&2
+                  cat /tmp/page.json >&2
+                  return 1
+                fi
+                # Header names are case-insensitive; strip spaces and the CR.
+                LIST_TOTAL=$(grep -i '^x-total-count:' /tmp/hdr.txt | tr -d ' \r' | cut -d: -f2)
+                case "$LIST_TOTAL" in ''|*[!0-9]*) LIST_TOTAL="" ;; esac
+                if [ -n "$LIST_TOTAL" ] && [ "$LIST_TOTAL" -gt "$PAGE_SIZE" ]; then
+                  echo "${label}: ${LIST_TOTAL} entries exceed the ${PAGE_SIZE} this Job reads in one page - cannot verify idempotently; reduce or dedupe them manually." >&2
+                  return 1
+                fi
+                # Split the JSON array into one object per line. Harbor marshals
+                # compact JSON (no spaces after commas), and a double quote
+                # inside a JSON string is always escaped as \", so the literal
+                # byte sequence },{" can only ever be an object boundary - it
+                # cannot occur inside a value such as a group named team},{ops.
+                # (Our own values can contain no " at all: render-rejected.)
+                sed 's/},{"/}\n{"/g' /tmp/page.json > "$out"
+              }
+
+              # ensure_project <name> <public:true|false>
+              ensure_project() {
+                name="$1"
+                public="$2"
+                # Harbor project names are [a-z0-9] plus . _ - so they are safe
+                # to interpolate into the query string unencoded.
+                status=$(curl -s -I -o /dev/null -w '%{http_code}' -u "$AUTH" \
+                  "${HARBOR_API}/projects?project_name=${name}")
+                if [ "$status" = "200" ]; then
+                  echo "project ${name}: already exists"
+                  return 0
+                fi
+                # metadata.public is a STRING ("true"/"false") in Harbor's API,
+                # not a JSON boolean.
+                payload=$(printf '{"project_name":"%s","metadata":{"public":"%s"}}' \
+                  "$name" "$public")
+                status=$(curl -s -o /tmp/resp.txt -w '%{http_code}' -u "$AUTH" \
+                  -X POST "${HARBOR_API}/projects" \
+                  -H "Content-Type: application/json" \
+                  -d "$payload")
+                case "$status" in
+                  201) echo "project ${name}: created (public=${public})" ;;
+                  409) echo "project ${name}: already exists (409)" ;;
+                  *)
+                    echo "project ${name}: create failed (HTTP ${status}):" >&2
+                    cat /tmp/resp.txt >&2
+                    return 1
+                    ;;
+                esac
+              }
+
+              # ensure_member <project> <group> <role_id>
+              ensure_member() {
+                name="$1"
+                group="$2"
+                role_id="$3"
+                # Look the group up first so re-runs stay quiet. The entityname
+                # filter is fuzzy and returns USERS as well as groups, so with
+                # one member object per line, require the same line to carry
+                # both the exact entity_name and entity_type "g" - otherwise a
+                # user who happens to share the group's name would silently
+                # suppress the group grant. Harbor emits compact JSON, hence the
+                # fixed-string greps. If this ever misses, the 409 below still
+                # keeps the Job idempotent.
+                fetch_page "project ${name}: members of ${group}" /tmp/members.txt \
+                  -G --data-urlencode "entityname=${group}" \
+                  --data-urlencode "page_size=${PAGE_SIZE}" \
+                  "${HARBOR_API}/projects/${name}/members"
+                if grep -F "\"entity_name\":\"${group}\"" /tmp/members.txt \
+                   | grep -qF '"entity_type":"g"'; then
+                  echo "project ${name}: group ${group} is already a member"
+                  return 0
+                fi
+                # group_type 3 = OIDC group.
+                payload=$(printf '{"role_id":%s,"member_group":{"group_name":"%s","group_type":3}}' \
+                  "$role_id" "$group")
+                status=$(curl -s -o /tmp/resp.txt -w '%{http_code}' -u "$AUTH" \
+                  -X POST "${HARBOR_API}/projects/${name}/members" \
+                  -H "$NAME_HDR" \
+                  -H "Content-Type: application/json" \
+                  -d "$payload")
+                case "$status" in
+                  201) echo "project ${name}: added group ${group} (role_id ${role_id})" ;;
+                  409) echo "project ${name}: group ${group} is already a member (409)" ;;
+                  *)
+                    echo "project ${name}: adding group ${group} failed (HTTP ${status}):" >&2
+                    cat /tmp/resp.txt >&2
+                    return 1
+                    ;;
+                esac
+              }
+
+              # ensure_immutable_rule <project> <tag_pattern> <repo_pattern>
+              ensure_immutable_rule() {
+                name="$1"
+                tag_pattern="$2"
+                repo_pattern="$3"
+                # Harbor does NOT reject an equivalent duplicate immutable rule
+                # (it inserts without comparing selectors), so unlike projects
+                # and members this lookup is the only thing keeping re-runs
+                # idempotent - it has to be right, and must fail loudly rather
+                # than half-read the rule list.
+                fetch_page "project ${name}: immutable tag rules" /tmp/rules.raw \
+                  "${HARBOR_API}/projects/${name}/immutabletagrules?page_size=${PAGE_SIZE}"
+                # Keep only lines holding a whole rule (both selector keys); grep
+                # also guarantees a trailing newline for the read loop below.
+                grep '"tag_selectors":' /tmp/rules.raw \
+                  | grep '"scope_selectors":' > /tmp/rules.txt || true
+                kept=$(wc -l < /tmp/rules.txt)
+                # A rule with several tag/scope selectors would split across
+                # lines and be dropped by the filter above; comparing against
+                # X-Total-Count catches that instead of creating a duplicate.
+                if [ -n "$LIST_TOTAL" ] && [ "$kept" -ne "$LIST_TOTAL" ]; then
+                  echo "project ${name}: could only parse ${kept} of ${LIST_TOTAL} immutable tag rules - refusing to risk a duplicate; reconcile them manually." >&2
+                  return 1
+                fi
+                while IFS= read -r rule; do
+                  # Extract each selector section BY KEY, terminated by the
+                  # other key (or end of object), so the comparison does not
+                  # depend on field order. The list endpoint returns go-swagger
+                  # generated models (ToSwagger in the immutable handler), which
+                  # marshal fields alphabetically - scope_selectors BEFORE
+                  # tag_selectors - unlike the pkg model's declaration order.
+                  # The key keeps its quotes and colon so a pattern whose value
+                  # merely mentions a key name cannot act as the delimiter
+                  # (ending the key needs a ", which our values cannot contain
+                  # and Harbor escapes as \" inside strings). Terminating at the
+                  # other key rather than the first ] keeps patterns containing
+                  # ] (glob character classes) intact.
+                  tags=${rule#*\"tag_selectors\":}
+                  tags=${tags%%\"scope_selectors\":*}
+                  scopes=${rule#*\"scope_selectors\":}
+                  scopes=${scopes%%\"tag_selectors\":*}
+                  printf '%s' "$tags" | grep -qF "\"pattern\":\"${tag_pattern}\"" || continue
+                  printf '%s' "$scopes" | grep -qF "\"pattern\":\"${repo_pattern}\"" || continue
+                  # A rule only counts as "already present" if it is the rule we
+                  # would create: enabled, with matches/repoMatches decorations.
+                  # A disabled or excludes/repoExcludes rule with the same
+                  # patterns does NOT protect these tags, so we still create.
+                  # "disabled" is omitempty in the swagger model: an enabled
+                  # rule carries NO disabled key, so test for the absence of
+                  # "disabled":true rather than the presence of "disabled":false.
+                  printf '%s' "$rule" | grep -qF '"disabled":true' && continue
+                  printf '%s' "$tags" | grep -qF '"decoration":"matches"' || continue
+                  printf '%s' "$scopes" | grep -qF '"decoration":"repoMatches"' || continue
+                  echo "project ${name}: immutable rule ${tag_pattern} on ${repo_pattern} already present"
+                  return 0
+                done < /tmp/rules.txt
+                payload=$(printf '{"disabled":false,"action":"immutable","template":"immutable_template","tag_selectors":[{"kind":"doublestar","decoration":"matches","pattern":"%s"}],"scope_selectors":{"repository":[{"kind":"doublestar","decoration":"repoMatches","pattern":"%s"}]}}' \
+                  "$tag_pattern" "$repo_pattern")
+                status=$(curl -s -o /tmp/resp.txt -w '%{http_code}' -u "$AUTH" \
+                  -X POST "${HARBOR_API}/projects/${name}/immutabletagrules" \
+                  -H "$NAME_HDR" \
+                  -H "Content-Type: application/json" \
+                  -d "$payload")
+                case "$status" in
+                  201) echo "project ${name}: immutable rule ${tag_pattern} on ${repo_pattern} created" ;;
+                  # Harbor does not currently 409 on an equivalent rule; handled
+                  # only in case a future version starts to.
+                  409) echo "project ${name}: immutable rule ${tag_pattern} on ${repo_pattern} already present (409)" ;;
+                  *)
+                    echo "project ${name}: immutable rule ${tag_pattern} on ${repo_pattern} failed (HTTP ${status}):" >&2
+                    cat /tmp/resp.txt >&2
+                    return 1
+                    ;;
+                esac
+              }
+              {{ range $project := .Values.bootstrap.projects }}
+              {{- $name := required "bootstrap.projects[].name is required" $project.name }}
+              {{- $public := ternary "true" "false" (default false $project.public) }}
+              ensure_project {{ include "harbor-pack.sh-literal" $name }} '{{ $public }}'
+              {{- range $member := $project.members }}
+              {{- $group := required "bootstrap.projects[].members[].group is required" $member.group }}
+              {{- $role := required "bootstrap.projects[].members[].role is required" $member.role }}
+              {{- $roleID := index $roleIDs $role }}
+              {{- if not $roleID }}
+              {{- fail (printf "bootstrap: unknown project role %q for group %q (expected one of projectAdmin, maintainer, developer, guest, limitedGuest)" $role $group) }}
+              {{- end }}
+              ensure_member {{ include "harbor-pack.sh-literal" $name }} {{ include "harbor-pack.sh-literal" $group }} '{{ $roleID }}'
+              {{- end }}
+              {{- range $rule := $project.immutableTags }}
+              {{- $tagPattern := required "bootstrap.projects[].immutableTags[].tagPattern is required" $rule.tagPattern }}
+              {{- $repoPattern := default "**" $rule.repoPattern }}
+              ensure_immutable_rule {{ include "harbor-pack.sh-literal" $name }} {{ include "harbor-pack.sh-literal" $tagPattern }} {{ include "harbor-pack.sh-literal" $repoPattern }}
+              {{- end }}
+              {{ end }}
+              echo "Harbor project bootstrap complete."
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+{{- end }}
