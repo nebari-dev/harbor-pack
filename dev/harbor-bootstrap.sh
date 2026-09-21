@@ -124,7 +124,10 @@ done
 [ -n "$ready" ] || die "no Harbor API on $API (is Harbor deployed? 'make up-sso')"
 
 echo "==> look up OIDC user '$SEED_USER' in Harbor"
-code=$(api GET "/users/search?username=$SEED_USER")
+# The search is fuzzy and paginated (default page size 10); ask for the maximum
+# page so a dev user whose name is a substring of many others is not missed.
+# The exact-match filter below picks the right entry out of the page.
+code=$(api GET "/users/search?username=$SEED_USER&page_size=100")
 [ "$code" = "200" ] || die "user search returned HTTP $code: $(cat "$BODY")"
 
 USER_ID=$(python3 - "$BODY" "$SEED_USER" <<'PY'
@@ -171,7 +174,9 @@ case "$code" in
   *) die "project create returned HTTP $code: $(cat "$BODY")" ;;
 esac
 
-code=$(api GET "/projects?name=$HARBOR_PROJECT")
+# name= is a fuzzy match and the listing is paginated; page_size=100 plus the
+# exact-match filter below keeps a substring-named project from being missed.
+code=$(api GET "/projects?name=$HARBOR_PROJECT&page_size=100")
 [ "$code" = "200" ] || die "project lookup returned HTTP $code: $(cat "$BODY")"
 PROJECT_ID=$(python3 - "$BODY" "$HARBOR_PROJECT" <<'PY'
 import json, sys

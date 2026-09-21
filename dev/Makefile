@@ -62,18 +62,19 @@ export METALLB_POOL
 # These are `export`ed rather than interpolated into recipe lines: the scripts read
 # them straight from the environment, so a value containing spaces, quotes or shell
 # metacharacters (an overridden password, say) can neither break the recipe nor inject
-# into it. Override on the command line, e.g. `make seed-user SEED_PASSWORD='s3 cr&t'`.
+# into it. Override on the command line, e.g. `make seed-user SEED_PASSWORD='s3 cr&t'`,
+# or via the environment (`?=` keeps an already-exported value rather than clobbering it).
 #
 # SEED_USER must NOT be `admin`: Harbor has a built-in local-DB `admin`, and its OIDC
 # auto-onboard refuses to create a second one.
 # --------------------------------------------------------------------------
-SEED_USER              := dev
-SEED_PASSWORD          := dev-password
-HARBOR_PROJECT         := dev
-HARBOR_NAMESPACE       := $(NAMESPACE)
-HARBOR_HOSTNAME        := $(HOSTNAME)
-HARBOR_ADMIN_PASSWORD  := $(ADMIN_PW)
-KUBECTL_CONTEXT        := kind-$(CLUSTER_NAME)
+SEED_USER              ?= dev
+SEED_PASSWORD          ?= dev-password
+HARBOR_PROJECT         ?= dev
+HARBOR_NAMESPACE       ?= $(NAMESPACE)
+HARBOR_HOSTNAME        ?= $(HOSTNAME)
+HARBOR_ADMIN_PASSWORD  ?= $(ADMIN_PW)
+KUBECTL_CONTEXT        ?= kind-$(CLUSTER_NAME)
 export SEED_USER SEED_PASSWORD HARBOR_PROJECT
 export HARBOR_NAMESPACE HARBOR_HOSTNAME HARBOR_ADMIN_PASSWORD KUBECTL_CONTEXT
 
