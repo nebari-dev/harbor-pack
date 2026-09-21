@@ -45,6 +45,15 @@ jobs:
           # -ignore-missing-schemas: NebariApp CRD schema is not bundled.
           kubeconform -strict -ignore-missing-schemas -summary /tmp/nebari.yaml
 
+      - name: Template (project bootstrap enabled)
+        run: |
+          helm template harbor chart/ \
+            --set nebariapp.enabled=false \
+            --set harbor.harborAdminPassword=ci \
+            -f examples/bootstrap-values.yaml \
+            > /tmp/bootstrap.yaml
+          kubeconform -strict -ignore-missing-schemas -summary /tmp/bootstrap.yaml
+
       - name: Validate pack-metadata.yaml
         run: |
           pip install check-jsonschema
