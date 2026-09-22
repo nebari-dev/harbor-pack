@@ -24,6 +24,20 @@ Harbor gives you two kinds of push/pull credential:
 The rest of this walkthrough uses a CLI secret; swap in a robot account's name and token to
 configure automation instead.
 
+:::tip Robot accounts can be provisioned by the pack
+You do not have to create automation credentials by hand. Declare them in
+`bootstrap.robots[]` and the pack creates each robot at install time and writes its credential
+into a Kubernetes Secret with `username`, `password` and `registry` keys — ready to mount into
+a CI Job or an in-cluster consumer. Harbor only ever reveals a robot secret once, so this is
+also the only way to get one back after a re-install. See
+[Declarative robot accounts](/configuration/#declarative-robot-accounts).
+
+```sh
+kubectl get secret harbor-robot-hub-cog-indexer -n harbor \
+  -o jsonpath='{.data.username}' | base64 -d
+```
+:::
+
 ### Step 1: Get registry credentials
 
 OIDC users cannot use their Keycloak password for the registry. Instead:

@@ -182,7 +182,7 @@ stableSecrets:
     apiClient: curlimages/curl:8.11.0  # creates the Secrets via the Kubernetes API
 
 # =============================================================================
-# Harbor project bootstrap Job
+# Harbor bootstrap Jobs (projects, robot accounts)
 # =============================================================================
 # Harbor never auto-creates projects, and projects (with their members, tag
 # immutability rules and webhook policies) live in Harbor's database, not in
@@ -193,6 +193,9 @@ stableSecrets:
 # rules are created only when absent; an existing webhook policy is re-PUT with
 # the declared state so endpoint/event edits propagate, never duplicated) - and
 # works with nebariapp.enabled: false too.
+#
+# `robots` is applied by a second Job at hook weight 11, i.e. after projects, so
+# a project-level robot's project already exists.
 bootstrap:
   enabled: false
   image: ""   # Defaults to oidcSetup.image (curl + /bin/sh is all it needs).
@@ -230,6 +233,38 @@ bootstrap:
   #       secretKey: authorization
   #     skipCertVerify: false
   #     enabled: true             # false keeps the policy but stops delivery
+
+  # ---------------------------------------------------------------------------
+  # Robot accounts
+  # ---------------------------------------------------------------------------
+  # Harbor returns a robot's secret exactly ONCE, in the create response, so the
+  # Job captures it straight into a Kubernetes Secret (keys: username, password,
+  # registry). Non-interactive consumers (CI, an in-cluster indexer) mount that
+  # Secret instead of a human's CLI secret.
+  #
+  # Note the Secrets are written by the Job through the Kubernetes API, not by
+  # Helm, so they are NOT removed by `helm uninstall` - delete them yourself.
+  robots: []
+  # robots:
+  #   - name: hub-cog-indexer     # lower-case; Harbor prefixes it (robot$cogs+hub-cog-indexer)
+  #     level: project            # project | system  (default: project)
+  #     project: cogs             # required for level: project; for level: system it
+  #                               # scopes the permissions to one project, otherwise
+  #                               # they apply to all projects ("*")
+  #     duration: -1              # days; -1 = never expires (default). Never rely on
+  #                               # Harbor's instance default (30 days) - a robot
+  #                               # created without a duration starts 401-ing silently.
+  #     # Default permission set is pull-only:
+  #     #   repository:pull, artifact:read, artifact:list, tag:list
+  #     # Override with explicit project-scope {resource, action} pairs, e.g. add
+  #     # {resource: repository, action: push} for a CI publisher.
+  #     permissions: []
+  #     secret:
+  #       name: harbor-robot-hub-cog-indexer
+  #       namespace: ""           # defaults to the release namespace. Setting another
+  #                               # namespace also renders a Role/RoleBinding there, so
+  #                               # the namespace must already exist; many consuming
+  #                               # charts would rather reflect/copy the Secret instead.
 
 # =============================================================================
 # Harbor (upstream subchart) overrides

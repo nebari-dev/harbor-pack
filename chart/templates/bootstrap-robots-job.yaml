@@ -1,0 +1,567 @@
+{{/*
+  Harbor robot account bootstrap Job
+  ----------------------------------
+  Harbor hands a robot's secret back exactly ONCE, in the create response - there
+  is no "show me the secret again" API. If nobody captures it at creation time it
+  is gone, which is why robots made by hand in the UI do not survive a fresh
+  install. This post-install/upgrade hook creates `bootstrap.robots[]` through
+  Harbor's REST API and writes each robot's credential straight into a Kubernetes
+  Secret (keys: username, password, registry) for non-interactive consumers.
+
+  Runs at hook weight 11, i.e. after the project bootstrap Job (10), so the
+  project a project-level robot is scoped to already exists.
+
+  Image / API access: this Job needs Harbor's API *and* the Kubernetes API. Rather
+  than pull in a kubectl image, it stays on the same curl image as the other Jobs
+  and talks to the Kubernetes REST API with curl, using the projected
+  ServiceAccount token and CA bundle. So: no new image, no jq, no kubectl.
+
+  ServiceAccount: a dedicated one (see bootstrap-robots-rbac.yaml) with only
+  create/get/update on Secrets - the project Job's "no Kubernetes access at all"
+  posture is not possible here, so the grant is kept as small as it can be.
+
+  Secret hygiene: the shell never runs under `set -x`, the robot secret is never
+  passed as a command-line argument (argv is world-readable in /proc) or echoed,
+  the ServiceAccount token goes to curl in a 0600 config file for the same
+  reason, API response bodies that contain credentials are read with sed and
+  deleted immediately (umask 077 and a trap cover the crash paths), and error
+  paths print only the `message` field of Harbor/Kubernetes errors - never a
+  response body, since robot and Secret payloads carry secret material.
+
+  Shell safety: values are rendered as single-quoted /bin/sh literals by
+  `harbor-pack.sh-literal`, which rejects quotes/backslashes/control characters
+  and doubles "$" so the kubelet's $(VAR) expansion - which happens before
+  /bin/sh ever sees the script, and has the admin password in scope - cannot be
+  reached from values. The permission JSON is assembled at render time instead,
+  from resource/action/project values matched against strict regexes, so it
+  likewise cannot carry a quote, a backslash or a "$".
+
+  Two Harbor API traps the lookup has to work around (see ensure_robot):
+    * GET /robots with no `Level` in `q` silently means "system robots only"
+      (Harbor defaults Level to system and ProjectID to 0), so project robots
+      have to be queried as `q=Level=project,ProjectID=<id>` - hence the project
+      id lookup first.
+    * Harbor URL-unescapes the `q` string a SECOND time after the HTTP layer has
+      already decoded it, which turns the "+" in a project robot's stored name
+      ("<project>+<name>") into a space. So the name is never filtered
+      server-side for project robots; the exact match is done locally.
+
+  Idempotency, keyed on the robot id recorded in the Secret's
+  harbor-pack.nebari.dev/robot-id annotation:
+    robot + Secret present, ids agree  -> nothing to do
+    robot + Secret present, ids differ -> rotate and rewrite (this is also what
+                                          heals a crash between "robot created"
+                                          and "Secret written", which would
+                                          otherwise publish a dead credential
+                                          forever)
+    robot present, Secret missing      -> PATCH /robots/{id} to mint a new
+                                          secret, then write the Secret (the old
+                                          secret is unrecoverable, so rotation is
+                                          the only way back to a working one)
+    robot missing                      -> POST /robots, write the Secret
+  An existing Secret is only ever overwritten when the robot behind it was just
+  created or rotated in the same run.
+*/}}
+{{- if and .Values.bootstrap.enabled .Values.bootstrap.robots }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "harbor-pack.fullname" . }}-bootstrap-robots
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "harbor-pack.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    # Higher than the project bootstrap Job (10) so projects exist first.
+    "helm.sh/hook-weight": "11"
+    "helm.sh/hook-delete-policy": before-hook-creation
+spec:
+  backoffLimit: 10
+  # Clean up automatically 10 minutes after completion (requires TTL controller).
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      labels:
+        {{- include "harbor-pack.selectorLabels" . | nindent 8 }}
+    spec:
+      restartPolicy: Never
+      serviceAccountName: {{ include "harbor-pack.fullname" . }}-bootstrap-robots
+      # Required: the script authenticates to the Kubernetes API with this token.
+      automountServiceAccountToken: true
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+      containers:
+        - name: bootstrap-robots
+          image: {{ .Values.bootstrap.image | default .Values.oidcSetup.image | quote }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          env:
+            - name: HARBOR_API
+              value: "http://{{ include "harbor-pack.harbor-service-name" . }}:{{ include "harbor-pack.harbor-service-port" . }}/api/v2.0"
+            - name: REGISTRY
+              value: {{ include "harbor-pack.registry-host" . | quote }}
+            - name: HARBOR_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "harbor-pack.admin-secret-name" . }}
+                  key: {{ .Values.oidcSetup.adminPasswordKey | quote }}
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+
+              # Several of the files below hold credential material for a moment
+              # (API responses, the Secret body, the token config). Keep them
+              # unreadable to anyone else from the very first write, and remove
+              # them however this script ends - including the `set -e` aborts.
+              umask 077
+              TMP_FILES="/tmp/hdr.txt /tmp/page.json /tmp/robots.txt /tmp/robots-obj.txt /tmp/project.json /tmp/robot-req.json /tmp/robot-resp.json /tmp/secret-get.json /tmp/secret-body.json /tmp/kube-resp.json /tmp/kube-auth.conf"
+              trap 'rm -f $TMP_FILES' EXIT
+
+              echo "Waiting for Harbor API at ${HARBOR_API} ..."
+              i=0
+              until curl -sf -o /dev/null "${HARBOR_API}/health"; do
+                i=$((i + 1))
+                if [ "$i" -ge 60 ]; then
+                  echo "Harbor API not healthy after ~5m; giving up." >&2
+                  exit 1
+                fi
+                sleep 5
+              done
+              echo "Harbor API is healthy."
+              {{- if not .Values.harbor.externalURL }}
+              echo "WARNING: harbor.externalURL is unset, so robot Secrets record the" >&2
+              echo "         in-cluster registry host ${REGISTRY} - reachable only from" >&2
+              echo "         inside the cluster and only over plain HTTP." >&2
+              {{- end }}
+
+              # Credentials are only ever passed to curl, never echoed.
+              AUTH="admin:${HARBOR_ADMIN_PASSWORD}"
+              DESCRIPTION="Managed by harbor-pack bootstrap"
+              # Tell Harbor the {project_name_or_id} path parameter is a name.
+              NAME_HDR="X-Is-Resource-Name: true"
+              # Harbor's maximum page size. This Job reads a single page and
+              # refuses to guess if a listing is larger (see fetch_page).
+              PAGE_SIZE=100
+
+              KUBE_API="https://kubernetes.default.svc"
+              SA_DIR="/var/run/secrets/kubernetes.io/serviceaccount"
+
+              # kube <curl args...>
+              # Call the Kubernetes REST API with the pod's ServiceAccount token.
+              # The token goes into a 0600 curl config file rather than onto the
+              # command line, where argv is readable through /proc. It is also
+              # re-read per call, because kubelet rotates projected tokens.
+              # -A: kube-apiserver pretty-prints JSON for curl's default
+              # User-Agent, which would break the single-line parsing below; a
+              # non-curl agent gets compact output on every call site.
+              kube() {
+                printf 'header = "Authorization: Bearer %s"\n' \
+                  "$(cat "${SA_DIR}/token")" > /tmp/kube-auth.conf
+                curl -sS -A harbor-pack-bootstrap --cacert "${SA_DIR}/ca.crt" \
+                  -K /tmp/kube-auth.conf "$@"
+              }
+
+              # api_error <file> - print just the "message" of an API error body,
+              # never the body itself. Robot and Secret payloads carry secret
+              # material, so unlike the projects Job this one never dumps a
+              # response body, not even on failure.
+              # Whitespace-tolerant so it still works if a body ever arrives
+              # pretty-printed despite the User-Agent above.
+              api_error() {
+                sed -n 's/.*"message"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$1" >&2 || true
+              }
+
+              # fetch_page <label> <out-file> <curl args...>
+              # Mirrors the project bootstrap Job's helper: GET one page of a
+              # Harbor list API, write it to <out-file> with one JSON object per
+              # line, and set LIST_TOTAL from the response's X-Total-Count. Fails
+              # when the result set does not fit the single page we read, rather
+              # than silently looking at a truncated list.
+              fetch_page() {
+                label="$1"
+                out="$2"
+                shift 2
+                LIST_TOTAL=""
+                status=$(curl -s -D /tmp/hdr.txt -o /tmp/page.json -w '%{http_code}' \
+                  -u "$AUTH" "$@")
+                if [ "$status" != "200" ]; then
+                  echo "${label}: listing failed (HTTP ${status}):" >&2
+                  api_error /tmp/page.json
+                  rm -f /tmp/hdr.txt /tmp/page.json
+                  return 1
+                fi
+                # Header names are case-insensitive; strip spaces and the CR.
+                LIST_TOTAL=$(grep -i '^x-total-count:' /tmp/hdr.txt | tr -d ' \r' | cut -d: -f2)
+                case "$LIST_TOTAL" in ''|*[!0-9]*) LIST_TOTAL="" ;; esac
+                if [ -n "$LIST_TOTAL" ] && [ "$LIST_TOTAL" -gt "$PAGE_SIZE" ]; then
+                  echo "${label}: ${LIST_TOTAL} entries exceed the ${PAGE_SIZE} this Job reads in one page - cannot verify idempotently." >&2
+                  rm -f /tmp/hdr.txt /tmp/page.json
+                  return 1
+                fi
+                # Split the JSON array into one object per line. Harbor marshals
+                # compact JSON (no spaces after commas), and a double quote
+                # inside a JSON string is always escaped as \", so the literal
+                # byte sequence },{" can only ever be an object boundary - it
+                # cannot occur inside a value such as a robot described as
+                # "a},{b". (Our own values can contain no " at all: render-rejected.)
+                sed 's/},{"/}\n{"/g' /tmp/page.json > "$out"
+                rm -f /tmp/hdr.txt /tmp/page.json
+              }
+
+              # field_number <object> <key> - first numeric value of "<key>":N.
+              # Splitting on commas puts each JSON member on its own line so the
+              # key is matched by name, not by position in the object.
+              field_number() {
+                printf '%s' "$1" | tr ',' '\n' \
+                  | grep -o "\"$2\":[0-9][0-9]*" | head -n 1 | cut -d: -f2
+              }
+
+              # field_string <object> <key> - first string value of "<key>":"V".
+              field_string() {
+                printf '%s' "$1" | tr ',' '\n' \
+                  | grep -o "\"$2\":\"[^\"]*\"" | head -n 1 \
+                  | sed "s/^\"$2\":\"//; s/\"\$//"
+              }
+
+              # project_id <project> - sets PROJECT_ID.
+              # Needed because Harbor only returns project robots for a query
+              # that carries the numeric project id.
+              project_id() {
+                PROJECT_ID=""
+                status=$(curl -s -u "$AUTH" -H "$NAME_HDR" \
+                  -o /tmp/project.json -w '%{http_code}' \
+                  "${HARBOR_API}/projects/$1")
+                if [ "$status" != "200" ]; then
+                  echo "project $1: lookup failed (HTTP ${status}) - does the project exist?" >&2
+                  api_error /tmp/project.json
+                  rm -f /tmp/project.json
+                  exit 1
+                fi
+                PROJECT_ID=$(field_number "$(cat /tmp/project.json)" project_id)
+                rm -f /tmp/project.json
+                if [ -z "$PROJECT_ID" ]; then
+                  echo "project $1: response carried no project_id" >&2
+                  exit 1
+                fi
+              }
+
+              # lookup_robot <stored_name> <q>
+              # Sets ROBOT_ID / ROBOT_NAME, returns 1 when the robot is absent.
+              #
+              # Harbor stores a project robot as "<project>+<name>" and a system
+              # robot as "<name>", then prefixes the API-visible name with a
+              # configurable robot prefix (default "robot$"). The match is
+              # therefore on the stored-name suffix, which is exact in both
+              # listings: within one project no other robot's name can end in
+              # "<project>+<name>" (a robot name cannot contain "+"), and the
+              # system query filters on the exact name server-side.
+              #
+              # Getting this wrong is expensive - a false negative creates a
+              # duplicate robot, a false positive rotates an unrelated robot's
+              # secret and breaks whatever was using it - so more than one match
+              # stops the Job rather than picking one.
+              lookup_robot() {
+                stored="$1"
+                query="$2"
+                ROBOT_ID=""
+                ROBOT_NAME=""
+                fetch_page "robot ${stored}" /tmp/robots.txt \
+                  -G --data-urlencode "q=${query}" \
+                  --data-urlencode "page_size=${PAGE_SIZE}" \
+                  "${HARBOR_API}/robots" || exit 1
+                # grep both drops non-object lines (e.g. an empty "[]") and
+                # guarantees the trailing newline the read loop needs.
+                grep '"name":"' /tmp/robots.txt > /tmp/robots-obj.txt || true
+                matches=0
+                while IFS= read -r object; do
+                  name=$(field_string "$object" name)
+                  case "$name" in
+                    *"${stored}")
+                      matches=$((matches + 1))
+                      ROBOT_NAME="$name"
+                      ROBOT_ID=$(field_number "$object" id)
+                      ;;
+                  esac
+                done < /tmp/robots-obj.txt
+                rm -f /tmp/robots.txt /tmp/robots-obj.txt
+                if [ "$matches" -gt 1 ]; then
+                  echo "robot ${stored}: ${matches} robots match that name; refusing to guess which one to use." >&2
+                  exit 1
+                fi
+                [ "$matches" -eq 1 ] || return 1
+                if [ -z "$ROBOT_ID" ]; then
+                  echo "robot ${stored}: matched robot ${ROBOT_NAME} carried no id" >&2
+                  exit 1
+                fi
+              }
+
+              # read_secret_state <namespace> <name>
+              # Sets SECRET_EXISTS (yes/no) and SECRET_ROBOT_ID - the robot id
+              # this Job recorded the last time it wrote the Secret. Empty for a
+              # Secret written before the annotation existed, or by something
+              # else; such a Secret gets one clean rotation so it becomes
+              # verifiable from then on.
+              read_secret_state() {
+                SECRET_EXISTS=no
+                SECRET_ROBOT_ID=""
+                status=$(kube -o /tmp/secret-get.json -w '%{http_code}' \
+                  "${KUBE_API}/api/v1/namespaces/$1/secrets/$2")
+                case "$status" in
+                  200)
+                    SECRET_EXISTS=yes
+                    # The body carries the credential: read only the annotation
+                    # out of it (| delimiter, the key contains a /) and drop it.
+                    # Whitespace-tolerant: a pretty-printed body (one field per
+                    # line, space after the colon) must still yield the id -
+                    # an empty id here would rotate the robot on every run.
+                    SECRET_ROBOT_ID=$(sed -n 's|.*"harbor-pack.nebari.dev/robot-id"[[:space:]]*:[[:space:]]*"\([0-9]*\)".*|\1|p' /tmp/secret-get.json)
+                    rm -f /tmp/secret-get.json
+                    ;;
+                  404)
+                    rm -f /tmp/secret-get.json
+                    ;;
+                  *)
+                    echo "Secret $1/$2: unexpected HTTP ${status} from the Kubernetes API" >&2
+                    rm -f /tmp/secret-get.json
+                    exit 1
+                    ;;
+                esac
+              }
+
+              # write_secret <namespace> <name> <username> <robot_id>
+              # The password comes from the global ROBOT_PASSWORD and the request
+              # body goes through a file, so the secret never reaches argv. The
+              # robot id is recorded as an annotation so a later run can tell
+              # whether this Secret still belongs to the robot in Harbor.
+              write_secret() {
+                ns="$1"
+                sname="$2"
+                username="$3"
+                robot_id="$4"
+                b_user=$(printf '%s' "$username" | base64 | tr -d '\n')
+                b_pass=$(printf '%s' "$ROBOT_PASSWORD" | base64 | tr -d '\n')
+                b_registry=$(printf '%s' "$REGISTRY" | base64 | tr -d '\n')
+                printf '{"apiVersion":"v1","kind":"Secret","metadata":{"name":"%s","namespace":"%s","labels":{"app.kubernetes.io/name":"%s","app.kubernetes.io/instance":"%s","app.kubernetes.io/managed-by":"harbor-pack-bootstrap"},"annotations":{"harbor-pack.nebari.dev/robot-id":"%s"}},"type":"Opaque","data":{"username":"%s","password":"%s","registry":"%s"}}' \
+                  "$sname" "$ns" {{ include "harbor-pack.sh-literal" (include "harbor-pack.name" .) }} {{ include "harbor-pack.sh-literal" .Release.Name }} \
+                  "$robot_id" "$b_user" "$b_pass" "$b_registry" > /tmp/secret-body.json
+                b_pass=""
+                status=$(kube -o /tmp/kube-resp.json -w '%{http_code}' \
+                  -X POST "${KUBE_API}/api/v1/namespaces/${ns}/secrets" \
+                  -H "Content-Type: application/json" \
+                  --data-binary @/tmp/secret-body.json)
+                if [ "$status" = "409" ]; then
+                  # No resourceVersion in the body, so this is an unconditional
+                  # replace - which is what we want: the Secret is ours to own.
+                  status=$(kube -o /tmp/kube-resp.json -w '%{http_code}' \
+                    -X PUT "${KUBE_API}/api/v1/namespaces/${ns}/secrets/${sname}" \
+                    -H "Content-Type: application/json" \
+                    --data-binary @/tmp/secret-body.json)
+                fi
+                rm -f /tmp/secret-body.json
+                case "$status" in
+                  200|201)
+                    rm -f /tmp/kube-resp.json
+                    echo "Secret ${ns}/${sname}: written for robot ${robot_id}"
+                    ;;
+                  *)
+                    echo "Secret ${ns}/${sname}: write failed (HTTP ${status}):" >&2
+                    api_error /tmp/kube-resp.json
+                    rm -f /tmp/kube-resp.json
+                    return 1
+                    ;;
+                esac
+              }
+
+              # create_robot <name> <level> <duration> <permissions_json>
+              # Sets ROBOT_ID, ROBOT_NAME (the full username Harbor returns) and
+              # ROBOT_PASSWORD (the one-shot secret).
+              create_robot() {
+                printf '{"name":"%s","description":"%s","level":"%s","duration":%s,"disable":false,"permissions":%s}' \
+                  "$1" "$DESCRIPTION" "$2" "$3" "$4" > /tmp/robot-req.json
+                status=$(curl -s -u "$AUTH" -o /tmp/robot-resp.json -w '%{http_code}' \
+                  -X POST "${HARBOR_API}/robots" \
+                  -H "Content-Type: application/json" \
+                  --data-binary @/tmp/robot-req.json)
+                rm -f /tmp/robot-req.json
+                if [ "$status" != "201" ]; then
+                  echo "robot $1: create failed (HTTP ${status}):" >&2
+                  api_error /tmp/robot-resp.json
+                  rm -f /tmp/robot-resp.json
+                  return 1
+                fi
+                response=$(cat /tmp/robot-resp.json)
+                ROBOT_ID=$(field_number "$response" id)
+                ROBOT_NAME=$(field_string "$response" name)
+                ROBOT_PASSWORD=$(field_string "$response" secret)
+                response=""
+                rm -f /tmp/robot-resp.json
+                if [ -z "$ROBOT_ID" ] || [ -z "$ROBOT_NAME" ] || [ -z "$ROBOT_PASSWORD" ]; then
+                  echo "robot $1: create response carried no id/name/secret" >&2
+                  return 1
+                fi
+                echo "robot $1: created as ${ROBOT_NAME} (id ${ROBOT_ID}, duration $3)"
+              }
+
+              # refresh_secret <robot_id> <name>
+              # An EMPTY RobotSec body makes Harbor mint a new compliant secret
+              # and return it. Sending our own secret instead would make Harbor
+              # answer with an empty body, so this is the only shape that yields
+              # a usable credential.
+              refresh_secret() {
+                status=$(curl -s -u "$AUTH" -o /tmp/robot-resp.json -w '%{http_code}' \
+                  -X PATCH "${HARBOR_API}/robots/$1" \
+                  -H "Content-Type: application/json" \
+                  -d '{}')
+                if [ "$status" != "200" ]; then
+                  echo "robot $2: secret refresh failed (HTTP ${status}):" >&2
+                  api_error /tmp/robot-resp.json
+                  rm -f /tmp/robot-resp.json
+                  return 1
+                fi
+                ROBOT_PASSWORD=$(field_string "$(cat /tmp/robot-resp.json)" secret)
+                rm -f /tmp/robot-resp.json
+                if [ -z "$ROBOT_PASSWORD" ]; then
+                  echo "robot $2: secret refresh returned no secret" >&2
+                  return 1
+                fi
+                echo "robot $2: secret rotated"
+              }
+
+              # ensure_robot <name> <stored_name> <level> <project> <duration> <permissions_json> <secret_ns> <secret_name>
+              ensure_robot() {
+                rname="$1"
+                stored="$2"
+                level="$3"
+                project="$4"
+                duration="$5"
+                perms="$6"
+                sns="$7"
+                sname="$8"
+                ROBOT_PASSWORD=""
+                if [ "$level" = "project" ]; then
+                  # GET /robots without Level means "system robots only", so a
+                  # project robot has to be queried by project id, and the name
+                  # cannot be filtered server-side (Harbor unescapes q twice,
+                  # turning the "+" in the stored name into a space).
+                  project_id "$project"
+                  query="Level=project,ProjectID=${PROJECT_ID}"
+                else
+                  query="Level=system,name=${stored}"
+                fi
+                if lookup_robot "$stored" "$query"; then
+                  read_secret_state "$sns" "$sname"
+                  if [ "$SECRET_EXISTS" = "yes" ] && [ "$SECRET_ROBOT_ID" = "$ROBOT_ID" ]; then
+                    echo "robot ${rname}: robot ${ROBOT_ID} and Secret ${sns}/${sname} are in sync - nothing to do"
+                    return 0
+                  fi
+                  if [ "$SECRET_EXISTS" = "no" ]; then
+                    echo "robot ${rname}: exists (id ${ROBOT_ID}) but Secret ${sns}/${sname} is missing - rotating"
+                  elif [ -z "$SECRET_ROBOT_ID" ]; then
+                    echo "robot ${rname}: Secret ${sns}/${sname} records no robot id - rotating once so it becomes verifiable"
+                  else
+                    echo "robot ${rname}: Secret ${sns}/${sname} records robot ${SECRET_ROBOT_ID}, not ${ROBOT_ID} - rotating"
+                  fi
+                  refresh_secret "$ROBOT_ID" "$rname"
+                else
+                  create_robot "$rname" "$level" "$duration" "$perms"
+                  read_secret_state "$sns" "$sname"
+                  if [ "$SECRET_EXISTS" = "yes" ]; then
+                    echo "robot ${rname}: replacing stale Secret ${sns}/${sname} (its robot was gone)"
+                  fi
+                fi
+                write_secret "$sns" "$sname" "$ROBOT_NAME" "$ROBOT_ID"
+                ROBOT_PASSWORD=""
+              }
+              {{ $destinations := dict }}
+              {{ $identities := dict }}
+              {{- range $robot := .Values.bootstrap.robots }}
+              {{- $name := required "bootstrap.robots[].name is required" $robot.name }}
+              {{- if not (regexMatch "^[a-z0-9]+([._-][a-z0-9]+)*$" $name) }}
+              {{- fail (printf "bootstrap: robot name %q must be lower-case alphanumerics separated by . _ or - (Harbor's own rule)" $name) }}
+              {{- end }}
+              {{- $level := default "project" $robot.level }}
+              {{- if not (has $level (list "project" "system")) }}
+              {{- fail (printf "bootstrap: robot %q has level %q (expected project or system)" $name $level) }}
+              {{- end }}
+              {{- $project := default "" $robot.project }}
+              {{- if and (eq $level "project") (not $project) }}
+              {{- fail (printf "bootstrap: robot %q is project-level, so bootstrap.robots[].project is required" $name) }}
+              {{- end }}
+              {{- if and $project (not (regexMatch "^[a-z0-9]+([._-][a-z0-9]+)*$" $project)) }}
+              {{- fail (printf "bootstrap: robot %q references project %q, which is not a valid Harbor project name" $name $project) }}
+              {{- end }}
+              {{- /* `default` treats 0 as empty, so read the key explicitly:
+                     duration 0 must be rejected, not silently turned into -1. */}}
+              {{- $duration := -1 }}
+              {{- if hasKey $robot "duration" }}
+              {{- $duration = $robot.duration }}
+              {{- end }}
+              {{- if kindIs "invalid" $duration }}
+              {{- $duration = -1 }}
+              {{- end }}
+              {{- $durationStr := printf "%v" $duration }}
+              {{- if not (regexMatch "^(-1|[1-9][0-9]*)$" $durationStr) }}
+              {{- fail (printf "bootstrap: robot %q has duration %v - it must be the whole number -1 (never expires) or a positive number of days; 0 and fractional values are rejected because Harbor would fall back to its 30-day instance default or round unpredictably" $name $duration) }}
+              {{- end }}
+              {{- /* Stored name: Harbor keys project robots as "<project>+<name>". */}}
+              {{- $stored := ternary (printf "%s+%s" $project $name) $name (eq $level "project") }}
+              {{- /* Permission namespace: the project, or all projects for an unscoped system-level robot. */}}
+              {{- $permNamespace := ternary $project "*" (ne $project "") }}
+              {{- $permissions := default (list) $robot.permissions }}
+              {{- if not $permissions }}
+              {{- $permissions = list (dict "resource" "repository" "action" "pull") (dict "resource" "artifact" "action" "read") (dict "resource" "artifact" "action" "list") (dict "resource" "tag" "action" "list") }}
+              {{- end }}
+              {{- $access := list }}
+              {{- range $permission := $permissions }}
+              {{- $resource := required "bootstrap.robots[].permissions[].resource is required" $permission.resource }}
+              {{- $action := required "bootstrap.robots[].permissions[].action is required" $permission.action }}
+              {{- if not (regexMatch "^([a-z][a-z0-9-]*|\\*)$" $resource) }}
+              {{- fail (printf "bootstrap: robot %q has permission resource %q, which is not a Harbor resource name" $name $resource) }}
+              {{- end }}
+              {{- if not (regexMatch "^([a-z][a-z0-9-]*|\\*)$" $action) }}
+              {{- fail (printf "bootstrap: robot %q has permission action %q, which is not a Harbor action" $name $action) }}
+              {{- end }}
+              {{- $access = append $access (printf "{\"resource\":\"%s\",\"action\":\"%s\"}" $resource $action) }}
+              {{- end }}
+              {{- $permissionsJSON := printf "[{\"kind\":\"project\",\"namespace\":\"%s\",\"access\":[%s]}]" $permNamespace (join "," $access) }}
+              {{- $secret := default (dict) $robot.secret }}
+              {{- $secretName := required "bootstrap.robots[].secret.name is required" $secret.name }}
+              {{- $secretNamespace := default $.Release.Namespace $secret.namespace }}
+              {{- if not (regexMatch "^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$" $secretName) }}
+              {{- fail (printf "bootstrap: robot %q has secret.name %q, which is not a valid Kubernetes object name" $name $secretName) }}
+              {{- end }}
+              {{- if not (regexMatch "^[a-z0-9]([a-z0-9-]*[a-z0-9])?$" $secretNamespace) }}
+              {{- fail (printf "bootstrap: robot %q has secret.namespace %q, which is not a valid Kubernetes namespace" $name $secretNamespace) }}
+              {{- end }}
+              {{- /* Two robots writing the same Secret would overwrite each
+                     other's credential on every run, leaving one of them with a
+                     Secret that does not match its robot. */}}
+              {{- $destination := printf "%s/%s" $secretNamespace $secretName }}
+              {{- if hasKey $destinations $destination }}
+              {{- fail (printf "bootstrap: robots %q and %q both write Secret %s - give each robot its own secret.name or secret.namespace" (index $destinations $destination) $name $destination) }}
+              {{- end }}
+              {{- $destinations = set $destinations $destination $name }}
+              {{- /* The same robot declared twice would rotate its own secret on
+                     every run, leaving the earlier entry's Secret holding a dead
+                     credential that the id-annotation check then trusts. */}}
+              {{- $identity := printf "%s:%s" $level $stored }}
+              {{- if hasKey $identities $identity }}
+              {{- fail (printf "bootstrap: robot %q (%s level%s) is declared more than once - each robot may appear only once in bootstrap.robots" $name $level (ternary (printf ", project %s" $project) "" (eq $level "project"))) }}
+              {{- end }}
+              {{- $identities = set $identities $identity $destination }}
+              ensure_robot {{ include "harbor-pack.sh-literal" $name }} {{ include "harbor-pack.sh-literal" $stored }} '{{ $level }}' {{ include "harbor-pack.sh-literal" $project }} '{{ $durationStr }}' '{{ $permissionsJSON }}' {{ include "harbor-pack.sh-literal" $secretNamespace }} {{ include "harbor-pack.sh-literal" $secretName }}
+              {{ end }}
+              echo "Harbor robot bootstrap complete."
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+{{- end }}

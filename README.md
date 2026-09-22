@@ -20,6 +20,7 @@ chart and adds Nebari integration: gateway routing, a landing-page card, and **K
 | **SSO** | The operator provisions a Keycloak OIDC client + Secret; a post-install Job switches Harbor into `oidc_auth` mode using those credentials. See [Authentication](#authentication). |
 | Projects | `bootstrap.projects[]` declares projects, group roles, and tag immutability rules; an idempotent post-install Job applies them. See [Declarative projects](#declarative-projects). |
 | Webhooks | `bootstrap.webhooks[]` declares project webhook policies (endpoint, events, Secret-sourced auth header); the same Job creates or updates them. See [Webhook policies](#webhook-policies). |
+| Robot accounts | `bootstrap.robots[]` declares long-lived, scoped pull/push credentials; a second post-install Job creates them and writes each secret into a Kubernetes Secret. See [Declarative robot accounts](#declarative-robot-accounts). |
 | Storage | Bundled Postgres/Redis + filesystem registry storage by default; toggles for S3/MinIO object storage and external managed Postgres/Redis. |
 
 ## Prerequisites
@@ -275,6 +276,90 @@ types are validated against what the running Harbor reports at
 `GET /projects/{name}/webhook/events`, so a typo fails the Job with the supported list rather
 than quietly creating a policy that never fires. Setting `enabled: false` keeps the policy but
 stops delivery; removing an entry from values does **not** delete the policy from Harbor.
+## Declarative robot accounts
+
+CI and in-cluster consumers need a credential that is not a human's CLI secret. Harbor's answer
+is a robot account, but Harbor reveals a robot's secret **exactly once**, in the create
+response — so a robot made by hand in the UI cannot be re-read and does not survive a fresh
+install. Declare them instead and the pack captures each secret straight into a Kubernetes
+Secret:
+
+```yaml
+bootstrap:
+  enabled: true
+  robots:
+    - name: hub-cog-indexer
+      level: project             # project | system
+      project: cogs              # required for level: project
+      duration: -1               # days; -1 = never expires (the default)
+      permissions: []            # [] = pull-only (repository:pull, artifact:read/list, tag:list)
+      secret:
+        name: harbor-robot-hub-cog-indexer
+        namespace: ""            # defaults to the release namespace
+```
+
+The resulting Secret carries everything a consumer needs to build a docker-style auth entry:
+
+| Key | Value |
+|---|---|
+| `username` | The **full** name Harbor returns, e.g. `robot$cogs+hub-cog-indexer` |
+| `password` | The robot secret (only ever visible at create/rotate time) |
+| `registry` | The host of `harbor.externalURL`, e.g. `harbor.nebari.example.com` |
+
+Each Secret also carries a `harbor-pack.nebari.dev/robot-id` annotation recording which Harbor
+robot the credential belongs to.
+
+Always set `duration`. Harbor's instance default is 30 days, so a robot created without one
+starts returning `401` a month later with nothing in the logs to explain it; `-1` means never.
+`0` and fractional values are rejected at render time rather than silently falling back to that
+default.
+
+The `harbor-harbor-pack-bootstrap-robots` Job runs at hook weight `11`, after the projects Job
+(`10`), so a project-level robot's project already exists. It is idempotent, and decides what
+to do by comparing the Secret's `robot-id` annotation against the robot it finds in Harbor:
+
+| State found | Action |
+|---|---|
+| Robot exists, Secret exists, ids agree | Nothing — a repeat `helm upgrade` is a no-op |
+| Robot exists, Secret exists, ids differ (or no annotation) | `PATCH /robots/{id}` to mint a fresh secret, then rewrite the Secret |
+| Robot exists, Secret missing | `PATCH /robots/{id}`, then write the Secret |
+| Robot missing | `POST /robots`, then write the Secret |
+
+Comparing ids rather than just "does a Secret exist" is what makes the Job crash-safe: if it
+dies between creating the robot and writing the Secret, the next run sees the mismatch and
+rotates, instead of leaving a dead credential published forever. Legacy Secrets without the
+annotation get exactly one rotation and are verifiable from then on.
+
+An existing Secret is only overwritten when the robot behind it was created or rotated in the
+same run — deleting the Secret and re-running restores it with a freshly rotated credential.
+Two robots may not target the same Secret; `helm template` fails if they do.
+
+The lookup itself is careful, because a false positive would rotate an unrelated robot's secret:
+project robots are listed by project id (`GET /robots` without a level silently means *system*
+robots only) and matched exactly on `<project>+<name>` locally, system robots are filtered
+server-side by exact name, and more than one match — or a listing larger than one page — stops
+the Job.
+
+The secret is never logged: the script never runs under `set -x`, never passes the secret (or
+the ServiceAccount token, which goes to `curl` in a `0600` config file) as a command-line
+argument, and prints only names, ids and API error messages — never a response body, since
+robot and Secret payloads carry secret material. Response files are written under `umask 077`
+and removed by an `EXIT` trap, so a mid-run failure leaves no credential behind in the pod.
+
+Unlike the projects Job, this one needs Kubernetes API access to write Secrets, so it runs as
+its own ServiceAccount with a Role granting `create` on Secrets plus `get`/`update` restricted
+to exactly the Secret names you declared. It talks to the Kubernetes REST API with `curl` and
+the pod's ServiceAccount token, so it shares the same image as the other Jobs — no `kubectl`,
+no extra image.
+
+> **Cross-namespace Secrets.** Setting `secret.namespace` also renders a Role/RoleBinding in
+> that namespace, which must already exist at install time. That means this chart writes into a
+> namespace it does not own; a consuming chart that would rather own its Secret should leave
+> `secret.namespace` empty and reflect/copy the Secret out of the release namespace itself.
+
+> **Not Helm-managed.** The Secrets are written through the Kubernetes API by the Job, not by
+> Helm, so `helm uninstall` leaves them behind. Delete them yourself when you remove the
+> release.
 
 ## Storage & backing services
 
@@ -498,6 +583,14 @@ Notes per key:
 | `bootstrap.webhooks[].authHeader.secretKey` | — | Key within that Secret. |
 | `bootstrap.webhooks[].skipCertVerify` | `false` | Skip TLS verification of the endpoint. |
 | `bootstrap.webhooks[].enabled` | `true` | `false` keeps the policy but stops delivery. |
+| `bootstrap.robots` | `[]` | Robot accounts to create (see [Declarative robot accounts](#declarative-robot-accounts)). |
+| `bootstrap.robots[].name` | — | Required; lower-case robot name. Harbor prefixes it (`robot$<project>+<name>`). |
+| `bootstrap.robots[].level` | `project` | `project` or `system`. |
+| `bootstrap.robots[].project` | `""` | Required for `level: project`; for `level: system` it scopes permissions to one project instead of all (`*`). |
+| `bootstrap.robots[].duration` | `-1` | Whole days until expiry; `-1` = never. `0` and fractional values are rejected — do not rely on Harbor's 30-day instance default. |
+| `bootstrap.robots[].permissions` | `[]` | `[]` = pull-only (`repository:pull`, `artifact:read`, `artifact:list`, `tag:list`); otherwise explicit project-scope `{resource, action}` pairs. |
+| `bootstrap.robots[].secret.name` | — | Required; name of the Kubernetes Secret to write. |
+| `bootstrap.robots[].secret.namespace` | `""` | Defaults to the release namespace; another namespace also renders a Role/RoleBinding there. |
 | `harbor.*` | — | Passed to the upstream Harbor chart. |
 
 ## Troubleshooting
@@ -521,6 +614,11 @@ Notes per key:
   prints no response body on purpose (Harbor may echo the auth header back); the reason is in
   the harbor-core logs (`deploy/harbor-core`, or `deploy/<release>-harbor-core` when the
   release name does not contain "harbor").
+- **Robot Secret missing after install** — check the robot Job:
+  `kubectl logs job/harbor-harbor-pack-bootstrap-robots -n <ns>`. It logs one line per robot
+  (never the secret). A `403` writing the Secret means the target namespace has no
+  Role/RoleBinding — it must be named in a `bootstrap.robots[].secret.namespace` and exist at
+  install time.
 - **"Login via OIDC Provider" missing** — the Job didn't complete; confirm
   `GET /api/v2.0/configurations` shows `auth_mode=oidc_auth`.
 - **`docker login` fails** — use a **CLI secret** or robot account, not your Keycloak
@@ -557,12 +655,15 @@ Notes per key:
   `helm template` in CI (integration tests use bundled filesystem/Postgres/Redis).
 - `bootstrap.projects` applies missing state only: it creates projects, group members and
   immutability rules, but does not update or remove ones that already exist (changing
-  `public:` for an existing project, or deleting an entry, has no effect). Robot accounts are
-  not covered yet.
+  `public:` for an existing project, or deleting an entry, has no effect).
 - `bootstrap.webhooks` creates and updates policies but never deletes them: removing an entry
   from values leaves the policy in Harbor (set `enabled: false` to stop delivery, or delete it
   in the UI). Like the other listings, the policy lookup reads one page and fails on
   `X-Total-Count` rather than acting on a truncated list.
+- `bootstrap.robots` is likewise create-only: an existing robot's `duration` or `permissions`
+  are never rewritten, and removing an entry leaves the robot and its Secret in place. Robot
+  `permissions` are project-scope resources (permission `kind: project`); system-scope
+  permissions are not exposed.
 - Upgrades follow upstream Harbor's chart; review upstream release notes before major bumps.
 
 ## License

@@ -1,0 +1,78 @@
+{{/*
+  RBAC for the robot bootstrap Job
+  --------------------------------
+  Unlike the project bootstrap Job - which talks only to Harbor and therefore
+  runs with no Kubernetes permissions at all - the robot Job has to WRITE the
+  Secret holding each robot's one-shot password. That needs its own identity, so
+  it gets a dedicated ServiceAccount rather than borrowing the pack SA (whose
+  Role the nebari-operator manages) or the namespace `default` SA.
+
+  One Role/RoleBinding is rendered per namespace named by a
+  `bootstrap.robots[].secret.namespace`, which includes the release namespace.
+  `create` cannot be restricted by resourceNames (the name is not known until
+  the request is admitted), so it is granted namespace-wide while `get`/`update`
+  are pinned to exactly the Secrets this chart declares.
+
+  Cross-namespace trade-off: a Role here means the chart writes into a namespace
+  it does not own, and that namespace must already exist at install time. A
+  consuming chart that would rather own its own Secret should leave
+  `secret.namespace` empty and reflect/copy the Secret out of the release
+  namespace itself (e.g. with a reflector controller or its own sync Job).
+
+  These are ordinary (non-hook) resources, so Helm creates them with the rest of
+  the release, before the post-install/upgrade hook Job runs.
+*/}}
+{{- if and .Values.bootstrap.enabled .Values.bootstrap.robots }}
+{{- $secretsByNamespace := dict }}
+{{- range $robot := .Values.bootstrap.robots }}
+{{- $secret := default (dict) $robot.secret }}
+{{- $secretName := required "bootstrap.robots[].secret.name is required" $secret.name }}
+{{- $secretNamespace := default $.Release.Namespace $secret.namespace }}
+{{- $existing := index $secretsByNamespace $secretNamespace | default (list) }}
+{{- $secretsByNamespace = set $secretsByNamespace $secretNamespace (append $existing $secretName) }}
+{{- end }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "harbor-pack.fullname" . }}-bootstrap-robots
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "harbor-pack.labels" . | nindent 4 }}
+{{- range $namespace, $names := $secretsByNamespace }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "harbor-pack.fullname" $ }}-bootstrap-robots
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "harbor-pack.labels" $ | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "update"]
+    resourceNames:
+      {{- range $name := $names | uniq | sortAlpha }}
+      - {{ $name | quote }}
+      {{- end }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "harbor-pack.fullname" $ }}-bootstrap-robots
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "harbor-pack.labels" $ | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "harbor-pack.fullname" $ }}-bootstrap-robots
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "harbor-pack.fullname" $ }}-bootstrap-robots
+    namespace: {{ $.Release.Namespace }}
+{{- end }}
+{{- end }}
