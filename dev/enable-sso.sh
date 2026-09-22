@@ -12,10 +12,12 @@
 #      NOTE: this restarts Keycloak, and the operator dev stack runs Keycloak in
 #      `start-dev` (in-memory H2) - a restart WIPES the realm. So we restart FIRST,
 #      then (re)create the realm, so the realm survives.
-#   4. Add a CoreDNS hosts entry so in-cluster pods (Harbor core) resolve
+#   4. Seed a non-admin realm user to log in with (dev/seed-user.sh). Harbor has its own
+#      built-in `admin`, so the realm admin can never onboard over OIDC.
+#   5. Add a CoreDNS hosts entry so in-cluster pods (Harbor core) resolve
 #      keycloak.nebari.local to the SAME issuer the browser uses (required: Harbor
 #      uses one OIDC endpoint for both browser redirects and server-side token calls).
-#   5. Install Harbor with oidcSetup.verifyCert=false (self-signed gateway CA).
+#   6. Install Harbor with oidcSetup.verifyCert=false (self-signed gateway CA).
 #
 # After it finishes, follow the printed host-access steps (need sudo).
 set -euo pipefail
@@ -27,6 +29,16 @@ OPERATOR_REPO="${OPERATOR_REPO:-$SCRIPT_DIR/.cache/nebari-operator}"
 CHART="$SCRIPT_DIR/../chart"
 KC_EXTERNAL_URL="https://keycloak.nebari.local/auth"
 HOSTNAME_HARBOR="harbor.nebari.local"
+HARBOR_ADMIN_PW="${HARBOR_ADMIN_PASSWORD:-Harbor12345}"
+SEED_USER="${SEED_USER:-dev}"
+SEED_PASSWORD="${SEED_PASSWORD:-dev-password}"
+export SEED_USER SEED_PASSWORD
+
+# Echo a password back only when it is the documented dev default; an overridden one is
+# the caller's, and has no business in terminal scrollback or CI logs.
+shown() { if [ "$1" = "$2" ]; then printf '%s' "$1"; else printf '%s' "(as configured)"; fi; }
+SEED_PASSWORD_SHOWN=$(shown "$SEED_PASSWORD" dev-password)
+HARBOR_ADMIN_PW_SHOWN=$(shown "$HARBOR_ADMIN_PW" Harbor12345)
 
 kubectl config use-context "kind-$CLUSTER"
 
@@ -60,7 +72,10 @@ kubectl -n keycloak rollout status statefulset/keycloak-keycloakx --timeout=240s
 echo "==> 3b. (re)create the nebari realm now that Keycloak is in its final state"
 "$OPERATOR_REPO/dev/scripts/services/keycloak/setup.sh"
 
-echo "==> 4. CoreDNS: resolve keycloak.nebari.local to the Envoy gateway ClusterIP in-cluster"
+echo "==> 4. seed a non-admin realm user for the SSO login (Harbor owns the name 'admin')"
+bash "$SCRIPT_DIR/seed-user.sh"
+
+echo "==> 5. CoreDNS: resolve keycloak.nebari.local to the Envoy gateway ClusterIP in-cluster"
 ENVOY_SVC=$(kubectl get svc -n envoy-gateway-system -l gateway.envoyproxy.io/owning-gateway-name=nebari-gateway -o jsonpath='{.items[0].metadata.name}')
 ENVOY_CIP=$(kubectl get svc -n envoy-gateway-system "$ENVOY_SVC" -o jsonpath='{.spec.clusterIP}')
 echo "    Envoy gateway service: $ENVOY_SVC  clusterIP: $ENVOY_CIP"
@@ -83,7 +98,7 @@ PY
 kubectl -n kube-system rollout restart deploy/coredns
 kubectl -n kube-system rollout status deploy/coredns --timeout=120s
 
-echo "==> 5. install/upgrade Harbor with SSO (verifyCert=false for self-signed CA)"
+echo "==> 6. install/upgrade Harbor with SSO (verifyCert=false for self-signed CA)"
 kubectl create namespace harbor --dry-run=client -o yaml | kubectl apply -f -
 kubectl label namespace harbor nebari.dev/managed=true --overwrite
 helm dependency update "$CHART"
@@ -91,7 +106,7 @@ helm upgrade --install harbor "$CHART" -n harbor \
   --set nebariapp.enabled=true \
   --set nebariapp.hostname="$HOSTNAME_HARBOR" \
   --set harbor.externalURL="https://$HOSTNAME_HARBOR" \
-  --set harbor.harborAdminPassword=Harbor12345 \
+  --set harbor.harborAdminPassword="$HARBOR_ADMIN_PW" \
   --set oidcSetup.verifyCert=false \
   --timeout 20m --wait
 
@@ -106,6 +121,16 @@ echo "   make host-access     # bridges :80/:443 to the gateway (no sudo)"
 echo "   # then the one-time /etc/hosts line it prints (needs sudo)"
 echo ""
 echo " Then open https://$HOSTNAME_HARBOR  -> LOGIN VIA OIDC PROVIDER"
-echo " Keycloak user: admin / nebari-admin  (realm: nebari)"
+echo ""
+echo "   SSO login (Keycloak realm 'nebari'):  $SEED_USER / $SEED_PASSWORD_SHOWN"
+echo ""
 echo " (accept the self-signed cert warning for both hostnames)"
+echo ""
+echo " Other accounts, NOT the SSO login:"
+echo "   admin / nebari-admin   - Keycloak realm admin. Harbor already has a local user"
+echo "                            named 'admin', so this one can never onboard over OIDC."
+echo "   admin / $HARBOR_ADMIN_PW_SHOWN    - Harbor's built-in local DB admin (Login via Local DB)."
+echo ""
+echo " After the first SSO login, give '$SEED_USER' admin + a project to push to:"
+echo "   make harbor-bootstrap"
 echo "=================================================================="
