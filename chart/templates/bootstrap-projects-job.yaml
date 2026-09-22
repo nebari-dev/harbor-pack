@@ -84,7 +84,7 @@ spec:
               valueFrom:
                 secretKeyRef:
                   name: {{ include "harbor-pack.admin-secret-name" . }}
-                  key: {{ .Values.oidcSetup.adminPasswordKey | quote }}
+                  key: {{ include "harbor-pack.admin-secret-key" . | quote }}
             {{- /*
               One env var per webhook that declares an authHeader, named after
               the entry's index in bootstrap.webhooks. The kubelet reads the

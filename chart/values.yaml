@@ -98,11 +98,88 @@ oidcSetup:
   # rejected here rather than silently overriding the chart - use the dedicated
   # option instead.
   systemConfig: {}
-  # Harbor admin credentials. The upstream chart writes them to the core Secret;
-  # leave these empty to read from that Secret (name/key computed by default), or
-  # override to point at your own Secret.
-  adminPasswordSecret: ""   # Defaults to "<harbor-fullname>-core".
+  # Harbor admin credentials. Leave empty to resolve automatically: the Secret
+  # named by harbor.existingSecretAdminPassword when that is set (upstream then
+  # omits the password from its core Secret), otherwise "<harbor-fullname>-core".
+  # Set these to point the Job at a Secret of your own instead.
+  adminPasswordSecret: ""
   adminPasswordKey: HARBOR_ADMIN_PASSWORD
+
+# =============================================================================
+# Stable secrets (GitOps)
+# =============================================================================
+# The upstream Harbor chart mints credentials at RENDER time when they are not
+# supplied (randAlphaNum for the core/jobservice/registry secrets, genCA for the
+# token-signing key pair, htpasswd for the registry credential). It reuses what
+# is already in the cluster via `lookup`, which returns nothing under a GitOps
+# controller that renders without cluster access. Every sync then draws fresh
+# values, re-keys four Secrets and rolls core, jobservice and registry.
+#
+# The fix is to keep the credentials in two Secrets that live in the cluster and
+# point upstream's existing-Secret options at them, so nothing is generated at
+# render time. Two `helm template` runs then produce byte-identical output.
+#
+#   internalSecret       Opaque, MUST carry all seven keys:
+#     secretKey             16 chars. Encrypts stored robot/registry credentials
+#                           in Harbor's database - BACK IT UP WITH THE DATA; lose
+#                           it and those credentials are unrecoverable.
+#     secret                16 chars. core <-> component shared secret.
+#     CSRF_KEY              32 chars exactly (harbor-core validates the length).
+#     JOBSERVICE_SECRET     16 chars.
+#     REGISTRY_HTTP_SECRET  16 chars. Shared by all registry replicas.
+#     REGISTRY_PASSWD       Plaintext password core/jobservice send to registry.
+#     REGISTRY_HTPASSWD     "<registry username>:<bcrypt hash of REGISTRY_PASSWD>"
+#                           (bcrypt only; the username defaults to
+#                           harbor_registry_user, see harbor.registry.credentials).
+#
+#   tokenSigningSecret   kubernetes.io/tls, keys tls.crt + tls.key. Signs the
+#                        registry auth tokens. The key must be PKCS#1
+#                        ("BEGIN RSA PRIVATE KEY"); Harbor's libtrust rejects
+#                        PKCS#8. Replacing it invalidates issued tokens.
+#
+# Helm cannot set a subchart's values from a parent template, so enabling this
+# does NOT rewrite the `harbor:` values for you - you must also set the seven
+# upstream keys (copy the block from examples/gitops-values.yaml). The chart
+# fails the render with the exact block to paste if they are missing.
+stableSecrets:
+  # Off by default: the chart behaves exactly as before unless you opt in.
+  enabled: false
+  # Run the pre-install/pre-upgrade (Argo CD PreSync) Job that creates the two
+  # Secrets above when they do not exist. Existing Secrets are never touched -
+  # the Job's Role grants only get + create, no update. Set false if you supply
+  # the Secrets yourself (SealedSecrets, ExternalSecrets, a manual kubectl).
+  provision: true
+  # DANGER FLAG. Enabling stableSecrets over a RUNNING install is a data-loss
+  # trap: upstream drops secretKey from its core Secret the moment
+  # existingSecretSecretKey is set, so a freshly generated key replaces the one
+  # that encrypts the robot-account and registry credentials already in Harbor's
+  # database - and they become undecryptable. The provisioning Job detects that
+  # transition (core Secret still carries a chart-generated secretKey, internal
+  # Secret absent) and refuses. Migrate the existing material instead: see
+  # "Migrating an existing install" in the README. Set this true only on an
+  # install whose data you are willing to lose.
+  allowFreshOnExisting: false
+  internalSecret: harbor-internal
+  tokenSigningSecret: harbor-token-signing
+  # Lifetime of the generated token-signing certificate. Long on purpose: the
+  # whole point is that it does not change. Rotating it is a deliberate act
+  # (see the README's "Stable secrets" section).
+  tokenCertDays: 3650
+  # Optionally generate the Harbor admin password too, removing the last manual
+  # pre-sync step. Requires harbor.existingSecretAdminPassword /
+  # existingSecretAdminPasswordKey to point at the same Secret and key.
+  adminPassword:
+    enabled: false
+    secretName: harbor-admin
+    key: HARBOR_ADMIN_PASSWORD
+  # Stock, pinned images for the provisioning Job. Three of them because no
+  # single stock image ships bcrypt htpasswd + openssl + API access, and the
+  # containers run with a read-only root filesystem so packages cannot be added
+  # at runtime. See chart/templates/stable-secrets-job.yaml for the rationale.
+  images:
+    htpasswd: httpd:2.4.68-alpine   # bcrypt htpasswd (registry accepts nothing else)
+    openssl: alpine/openssl:3.3.2   # token-signing key pair
+    apiClient: curlimages/curl:8.11.0  # creates the Secrets via the Kubernetes API
 
 # =============================================================================
 # Harbor project bootstrap Job
@@ -163,6 +240,28 @@ harbor:
   # Set to https://<nebariapp.hostname>. Required for correct token-service and
   # OIDC redirect URLs. See examples/nebari-values.yaml.
   externalURL: ""
+
+  # --- Stable secrets fan-out (see the stableSecrets block above) -------------
+  # Uncomment together with `stableSecrets.enabled: true`. These seven keys are
+  # what actually stops the upstream chart generating credentials at render
+  # time; the names must match stableSecrets.internalSecret /
+  # .tokenSigningSecret. Left commented out by default because they would
+  # otherwise point a plain install at Secrets that do not exist.
+  #
+  # existingSecretSecretKey: harbor-internal
+  # core:
+  #   existingSecret: harbor-internal
+  #   existingXsrfSecret: harbor-internal
+  #   secretName: harbor-token-signing
+  # jobservice:
+  #   existingSecret: harbor-internal
+  # registry:
+  #   existingSecret: harbor-internal
+  #   credentials:
+  #     existingSecret: harbor-internal
+  # With stableSecrets.adminPassword.enabled: true, also:
+  # existingSecretAdminPassword: harbor-admin
+  # existingSecretAdminPasswordKey: HARBOR_ADMIN_PASSWORD
 
   expose:
     # The Nebari gateway terminates TLS and routes to this ClusterIP service, so
