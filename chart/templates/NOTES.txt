@@ -1,5 +1,23 @@
 {{ include "harbor-pack.fullname" . }} has been deployed (Harbor {{ .Chart.AppVersion }}).
 
+{{- if .Values.stableSecrets.enabled }}
+
+Stable secrets are ENABLED - credentials live in the cluster, not in the render:
+  - {{ .Values.stableSecrets.internalSecret }} (Opaque; secretKey, secret, CSRF_KEY, JOBSERVICE_SECRET, REGISTRY_HTTP_SECRET, REGISTRY_PASSWD, REGISTRY_HTPASSWD)
+  - {{ .Values.stableSecrets.tokenSigningSecret }} (kubernetes.io/tls; tls.crt, tls.key)
+  {{- if .Values.stableSecrets.adminPassword.enabled }}
+  - {{ .Values.stableSecrets.adminPassword.secretName }} (Opaque; {{ .Values.stableSecrets.adminPassword.key }})
+  {{- end }}
+  {{- if .Values.stableSecrets.provision }}
+
+  The pre-install/PreSync Job "{{ include "harbor-pack.stable-secrets.name" . }}" created any
+  that were missing and left existing ones untouched.
+  {{- end }}
+
+  BACK UP {{ .Values.stableSecrets.internalSecret }} WITH YOUR DATABASE: its secretKey
+  encrypts the robot-account and registry credentials stored in Harbor.
+{{- end }}
+
 {{- if .Values.nebariapp.enabled }}
 
 NebariApp is ENABLED. The nebari-operator will configure:
