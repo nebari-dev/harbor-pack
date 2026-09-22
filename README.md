@@ -91,6 +91,8 @@ Deploys Harbor with the complete browser SSO flow working end-to-end:
 cd dev
 make up-sso          # bootstraps the cluster + wires SSO + installs Harbor
 make host-access     # bridges host :80/:443 to the gateway (no sudo) + prints the /etc/hosts line
+# open https://harbor.nebari.local, log in as dev / dev-password, then:
+make harbor-bootstrap   # sysadmin + a `dev` project for that user
 ```
 
 `make up-sso` creates the kind cluster with host ports 80/443 published (`kind-config.yaml`),
@@ -108,13 +110,25 @@ Keycloak at `keycloak.nebari.local` through the gateway, sets `KC_PROXY_HEADERS=
 and adds a CoreDNS `hosts` entry so the issuer is identical from the browser and from Harbor
 core. It installs Harbor with `oidcSetup.verifyCert=false` (self-signed dev CA).
 
-Then open `https://harbor.nebari.local` → **LOGIN VIA OIDC PROVIDER** (Keycloak user
-`admin` / `nebari-admin`, realm `nebari`; accept the self-signed cert warnings).
+Then open `https://harbor.nebari.local` → **LOGIN VIA OIDC PROVIDER** and sign in as the
+Keycloak user **`dev` / `dev-password`** (realm `nebari`; accept the self-signed cert
+warnings). `make up-sso` seeds that user via `dev/seed-user.sh`.
+
+The realm admin `admin` / `nebari-admin` is *not* an SSO login: Harbor has a built-in local
+user called `admin`, so its OIDC auto-onboard refuses to create a second one and the callback
+fails with `user admin or email admin@nebari.local already exists`. Use `admin` /
+`Harbor12345` for **Login via Local DB**, and the realm admin only for the Keycloak console.
+
+A freshly onboarded OIDC user has no privileges and no project to push to. After that first
+login, `make harbor-bootstrap` grants it system admin, creates a `dev` project with the user
+as project admin, and prints the matching `nebi registry add` line.
 
 > **Caveat:** the operator dev stack runs Keycloak in `start-dev` (in-memory H2), so any
-> Keycloak pod restart wipes the realm. `enable-sso.sh` restarts Keycloak *before* creating
-> the realm to avoid this; if you restart Keycloak later, re-run
-> `.cache/nebari-operator/dev/scripts/services/keycloak/setup.sh`.
+> Keycloak pod restart wipes the realm — and the seeded `dev` user with it.
+> `enable-sso.sh` restarts Keycloak *before* creating the realm to avoid this; if you restart
+> Keycloak later, re-run
+> `CLUSTER_NAME=harbor-pack-dev .cache/nebari-operator/dev/scripts/services/keycloak/setup.sh`
+> (the operator script needs the cluster name) and then `make seed-user`.
 
 ## Authentication
 
@@ -268,6 +282,17 @@ and [`examples/nebari-values.yaml`](examples/nebari-values.yaml):
   password (OIDC users cannot use their IdP password for the registry).
 - **Keycloak `redirect_uri` error** — ensure `nebariapp.auth.redirectURI` is
   `/c/oidc/callback` and `harbor.externalURL` matches `https://<hostname>`.
+- **OIDC callback: `user ... already exists`** — the Keycloak username collides with a Harbor
+  local-DB user (`admin` does). Log in as a differently-named realm user; in dev that's the
+  seeded `dev` user (`make seed-user`).
+- **dev: `make up-sso` reuses a half-built kind cluster** — the `cluster` target only checks
+  that kind knows the cluster name, so a run that died partway through setup is silently
+  reused. Re-run the step that failed (`make _metallb` / `_services` / `_keycloak-setup` /
+  `_operator`), or `make down` and start clean.
+- **dev on Colima: every pod times out talking to the API server** — Docker may give the
+  `kind` network a subnet that overlaps your LAN (e.g. `192.168.1.0/24`). Pre-create it on
+  `172.x` before `make up-sso`; see
+  [Local development](docs/src/content/docs/local-development.md).
 
 ## Known limitations
 
