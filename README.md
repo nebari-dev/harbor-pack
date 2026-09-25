@@ -321,7 +321,7 @@ it first reconciles the robot itself with what values declare:
 | Robot state in Harbor | Action |
 |---|---|
 | Expired (`expires_at` has passed) | `DELETE` + `POST /robots` — Harbor only recomputes the expiry when the duration changes, so an expired robot cannot be revived in place — then write the Secret |
-| Disabled | `PATCH /robots/{id}` to rotate the secret **before** re-enabling it, so a credential someone cut off stays dead, then rewrite the Secret |
+| Disabled | `PATCH /robots/{id}` to rotate the secret and rewrite the Secret, and only **then** the `PUT` below re-enables it — so a credential someone cut off stays dead, and a crash in between leaves the robot disabled (the next run rotates again) instead of enabled behind a dead Secret |
 | Present | `PUT /robots/{id}` re-asserts the declared description, `duration`, `permissions` and `disable: false` (the secret is untouched). If the duration changed, the new expiry is re-read and an already-past one is recreated as above |
 
 Then it decides what to do with the credential by comparing the Secret's `robot-id` annotation

@@ -59,9 +59,13 @@
                                           part of that body and is untouched);
                                           if the duration changed, re-read the
                                           expiry and recreate if it has passed
-    robot was disabled                 -> rotate its secret BEFORE the PUT
-                                          re-enables it, so a credential that was
-                                          cut off on purpose never works again
+    robot was disabled                 -> rotate its secret and write the Secret
+                                          BEFORE the PUT re-enables it, so a
+                                          credential that was cut off on purpose
+                                          never works again, and a crash in
+                                          between leaves the robot disabled (the
+                                          next run rotates again) rather than
+                                          enabled behind a dead Secret
   and then, keyed on the robot id recorded in the Secret's
   harbor-pack.nebari.dev/robot-id annotation:
     robot + Secret present, ids agree  -> patch the Secret's username/registry
@@ -376,10 +380,18 @@ spec:
                     # line, space after the colon) must still yield the id -
                     # an empty id here would rotate the robot on every run.
                     SECRET_ROBOT_ID=$(sed -n 's|.*"harbor-pack.nebari.dev/robot-id"[[:space:]]*:[[:space:]]*"\([0-9]*\)".*|\1|p' /tmp/secret-get.json)
-                    # managedFields spell these keys "f:username", so the
-                    # quoted-key match only ever hits the data block.
-                    SECRET_USERNAME_B64=$(sed -n 's|.*"username"[[:space:]]*:[[:space:]]*"\([^"]*\)".*|\1|p' /tmp/secret-get.json)
-                    SECRET_REGISTRY_B64=$(sed -n 's|.*"registry"[[:space:]]*:[[:space:]]*"\([^"]*\)".*|\1|p' /tmp/secret-get.json)
+                    # Read the two keys out of the "data" object only, so a label
+                    # or annotation that happens to be called "registry" cannot
+                    # stand in for it (managedFields spell it "f:data", and the
+                    # data object holds only strings, so [^}]* is all of it).
+                    # Newlines are dropped first to stay whitespace-tolerant.
+                    secret_data=$(tr -d '\n' < /tmp/secret-get.json \
+                      | sed -n 's|.*"data"[[:space:]]*:[[:space:]]*{\([^}]*\)}.*|\1|p')
+                    SECRET_USERNAME_B64=$(printf '%s' "$secret_data" | tr ',' '\n' \
+                      | sed -n 's|^[[:space:]]*"username"[[:space:]]*:[[:space:]]*"\([^"]*\)".*|\1|p')
+                    SECRET_REGISTRY_B64=$(printf '%s' "$secret_data" | tr ',' '\n' \
+                      | sed -n 's|^[[:space:]]*"registry"[[:space:]]*:[[:space:]]*"\([^"]*\)".*|\1|p')
+                    secret_data=""
                     rm -f /tmp/secret-get.json
                     ;;
                   404)
@@ -573,6 +585,26 @@ spec:
                 echo "robot $2: secret rotated"
               }
 
+              # reassert_robot <name> <level> <duration> <permissions_json> <secret_ns> <secret_name>
+              # PUT the declared settings onto the robot lookup_robot found. If
+              # that changed the duration, re-read the expiry: Harbor recomputes
+              # it from the creation time, so a shorter duration can put an old
+              # robot straight past it - in which case recreate it and write
+              # its Secret here. Sets RECREATED=yes when it did.
+              reassert_robot() {
+                RECREATED=""
+                update_robot "$ROBOT_ID" "$ROBOT_NAME" "$2" "$3" "$4" "$1"
+                [ "$ROBOT_DURATION" != "$3" ] || return 0
+                robot_expiry "$ROBOT_ID" "$1"
+                robot_expired "$ROBOT_EXPIRES_AT" || return 0
+                echo "robot $1: robot ${ROBOT_ID} is expired under its new $3-day duration - recreating it"
+                delete_robot "$ROBOT_ID" "$1"
+                create_robot "$1" "$2" "$3" "$4"
+                write_secret "$5" "$6" "$ROBOT_NAME" "$ROBOT_ID"
+                ROBOT_PASSWORD=""
+                RECREATED=yes
+              }
+
               # ensure_robot <name> <stored_name> <level> <project> <duration> <permissions_json> <secret_ns> <secret_name>
               ensure_robot() {
                 rname="$1"
@@ -595,36 +627,26 @@ spec:
                   query="Level=system,name=${stored}"
                 fi
                 if lookup_robot "$stored" "$query"; then
-                  # rotated: the robot was just created or its secret minted in
-                  # this run, so ROBOT_PASSWORD holds what the Secret must say.
-                  rotated=""
                   if robot_expired "$ROBOT_EXPIRES_AT"; then
                     echo "robot ${rname}: robot ${ROBOT_ID} expired - recreating it"
                     delete_robot "$ROBOT_ID" "$rname"
                     create_robot "$rname" "$level" "$duration" "$perms"
-                    rotated=yes
+                  elif [ "$ROBOT_DISABLED" = "true" ]; then
+                    # Rotate and publish first, re-enable last. Re-enabling
+                    # before the rotation would briefly revive a credential
+                    # someone deliberately cut off; re-enabling before the
+                    # Secret is written would, after a crash, leave an enabled
+                    # robot whose Secret still agrees by id but holds a dead
+                    # password - which the next run would take as in sync.
+                    echo "robot ${rname}: robot ${ROBOT_ID} is disabled in Harbor - rotating its secret, then re-enabling it"
+                    refresh_secret "$ROBOT_ID" "$rname"
+                    write_secret "$sns" "$sname" "$ROBOT_NAME" "$ROBOT_ID"
+                    ROBOT_PASSWORD=""
+                    reassert_robot "$rname" "$level" "$duration" "$perms" "$sns" "$sname"
+                    return 0
                   else
-                    if [ "$ROBOT_DISABLED" = "true" ]; then
-                      # Rotate first: re-enabling before the rotation would
-                      # briefly revive a credential someone deliberately cut off.
-                      echo "robot ${rname}: robot ${ROBOT_ID} is disabled in Harbor - rotating its secret, then re-enabling it"
-                      refresh_secret "$ROBOT_ID" "$rname"
-                      rotated=yes
-                    fi
-                    update_robot "$ROBOT_ID" "$ROBOT_NAME" "$level" "$duration" "$perms" "$rname"
-                    if [ "$ROBOT_DURATION" != "$duration" ]; then
-                      # Harbor recomputes expires_at from the creation time, so
-                      # a shorter duration can put an old robot straight past it.
-                      robot_expiry "$ROBOT_ID" "$rname"
-                      if robot_expired "$ROBOT_EXPIRES_AT"; then
-                        echo "robot ${rname}: robot ${ROBOT_ID} is expired under its new ${duration}-day duration - recreating it"
-                        delete_robot "$ROBOT_ID" "$rname"
-                        create_robot "$rname" "$level" "$duration" "$perms"
-                        rotated=yes
-                      fi
-                    fi
-                  fi
-                  if [ -z "$rotated" ]; then
+                    reassert_robot "$rname" "$level" "$duration" "$perms" "$sns" "$sname"
+                    [ -z "$RECREATED" ] || return 0
                     read_secret_state "$sns" "$sname"
                     if [ "$SECRET_EXISTS" = "yes" ] && [ "$SECRET_ROBOT_ID" = "$ROBOT_ID" ]; then
                       echo "robot ${rname}: robot ${ROBOT_ID} and Secret ${sns}/${sname} are in sync"
