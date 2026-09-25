@@ -10,8 +10,10 @@
   One Role/RoleBinding is rendered per namespace named by a
   `bootstrap.robots[].secret.namespace`, which includes the release namespace.
   `create` cannot be restricted by resourceNames (the name is not known until
-  the request is admitted), so it is granted namespace-wide while `get`/`update`
-  are pinned to exactly the Secrets this chart declares.
+  the request is admitted), so it is granted namespace-wide while
+  `get`/`update`/`patch` are pinned to exactly the Secrets this chart declares.
+  (`patch` corrects a drifted username/registry key without touching the
+  password.)
 
   Cross-namespace trade-off: a Role here means the chart writes into a namespace
   it does not own, and that namespace must already exist at install time. A
@@ -53,7 +55,7 @@ rules:
     verbs: ["create"]
   - apiGroups: [""]
     resources: ["secrets"]
-    verbs: ["get", "update"]
+    verbs: ["get", "update", "patch"]
     resourceNames:
       {{- range $name := $names | uniq | sortAlpha }}
       - {{ $name | quote }}

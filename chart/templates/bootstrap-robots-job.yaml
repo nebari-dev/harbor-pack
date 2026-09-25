@@ -46,9 +46,31 @@
       ("<project>+<name>") into a space. So the name is never filtered
       server-side for project robots; the exact match is done locally.
 
-  Idempotency, keyed on the robot id recorded in the Secret's
+  Reconciliation. Every run re-asserts the declared robot, not just its
+  existence:
+    robot expired                      -> DELETE + POST (Harbor only recomputes
+                                          expires_at from the creation time when
+                                          the duration changes, so an expired
+                                          robot cannot be revived in place), then
+                                          write the Secret
+    robot present                      -> PUT /robots/{id} with the declared
+                                          description, duration and permissions
+                                          and disable=false (the secret is not
+                                          part of that body and is untouched);
+                                          if the duration changed, re-read the
+                                          expiry and recreate if it has passed
+    robot was disabled                 -> rotate its secret and write the Secret
+                                          BEFORE the PUT re-enables it, so a
+                                          credential that was cut off on purpose
+                                          never works again, and a crash in
+                                          between leaves the robot disabled (the
+                                          next run rotates again) rather than
+                                          enabled behind a dead Secret
+  and then, keyed on the robot id recorded in the Secret's
   harbor-pack.nebari.dev/robot-id annotation:
-    robot + Secret present, ids agree  -> nothing to do
+    robot + Secret present, ids agree  -> patch the Secret's username/registry
+                                          keys if they drifted (e.g. a changed
+                                          harbor.externalURL), else nothing
     robot + Secret present, ids differ -> rotate and rewrite (this is also what
                                           heals a crash between "robot created"
                                           and "Secret written", which would
@@ -59,8 +81,8 @@
                                           secret is unrecoverable, so rotation is
                                           the only way back to a working one)
     robot missing                      -> POST /robots, write the Secret
-  An existing Secret is only ever overwritten when the robot behind it was just
-  created or rotated in the same run.
+  An existing Secret's password is only ever overwritten when the robot behind
+  it was just created or rotated in the same run.
 */}}
 {{- if and .Values.bootstrap.enabled .Values.bootstrap.robots }}
 apiVersion: batch/v1
@@ -120,7 +142,7 @@ spec:
               # unreadable to anyone else from the very first write, and remove
               # them however this script ends - including the `set -e` aborts.
               umask 077
-              TMP_FILES="/tmp/hdr.txt /tmp/page.json /tmp/robots.txt /tmp/robots-obj.txt /tmp/project.json /tmp/robot-req.json /tmp/robot-resp.json /tmp/secret-get.json /tmp/secret-body.json /tmp/kube-resp.json /tmp/kube-auth.conf"
+              TMP_FILES="/tmp/hdr.txt /tmp/page.json /tmp/robots.txt /tmp/robots-obj.txt /tmp/project.json /tmp/robot-req.json /tmp/robot-resp.json /tmp/robot-get.json /tmp/secret-get.json /tmp/secret-patch.json /tmp/secret-body.json /tmp/kube-resp.json /tmp/kube-auth.conf"
               trap 'rm -f $TMP_FILES' EXIT
 
               echo "Waiting for Harbor API at ${HARBOR_API} ..."
@@ -229,6 +251,25 @@ spec:
                   | sed "s/^\"$2\":\"//; s/\"\$//"
               }
 
+              # field_int <object> <key> - first integer value of "<key>":N,
+              # sign included (expires_at and duration are -1 for "never").
+              field_int() {
+                printf '%s' "$1" | tr ',' '\n' \
+                  | grep -o "\"$2\":-\{0,1\}[0-9][0-9]*" | head -n 1 | cut -d: -f2
+              }
+
+              # field_bool <object> <key> - "true" or "false".
+              field_bool() {
+                printf '%s' "$1" | tr ',' '\n' \
+                  | grep -oE "\"$2\":(true|false)" | head -n 1 | cut -d: -f2
+              }
+
+              # robot_expired <expires_at> - Harbor's own test (security/robot.go):
+              # a robot stops authenticating once expires_at <= now, -1 = never.
+              robot_expired() {
+                [ -n "$1" ] && [ "$1" != "-1" ] && [ "$1" -le "$(date +%s)" ]
+              }
+
               # project_id <project> - sets PROJECT_ID.
               # Needed because Harbor only returns project robots for a query
               # that carries the numeric project id.
@@ -252,7 +293,15 @@ spec:
               }
 
               # lookup_robot <stored_name> <q>
-              # Sets ROBOT_ID / ROBOT_NAME, returns 1 when the robot is absent.
+              # Sets ROBOT_ID / ROBOT_NAME / ROBOT_DISABLED / ROBOT_EXPIRES_AT /
+              # ROBOT_DURATION, returns 1 when the robot is absent.
+              #
+              # The listing carries each robot's permissions, whose access list
+              # also contains "},{" boundaries, so fetch_page leaves a robot
+              # split over several lines. That is harmless: go-swagger marshals
+              # fields alphabetically, so every scalar read here (disable,
+              # duration, expires_at, id, name) sits on the robot's first line,
+              # before "permissions" - and only that line carries "name":".
               #
               # Harbor stores a project robot as "<project>+<name>" and a system
               # robot as "<name>", then prefixes the API-visible name with a
@@ -271,6 +320,9 @@ spec:
                 query="$2"
                 ROBOT_ID=""
                 ROBOT_NAME=""
+                ROBOT_DISABLED=""
+                ROBOT_EXPIRES_AT=""
+                ROBOT_DURATION=""
                 fetch_page "robot ${stored}" /tmp/robots.txt \
                   -G --data-urlencode "q=${query}" \
                   --data-urlencode "page_size=${PAGE_SIZE}" \
@@ -286,6 +338,9 @@ spec:
                       matches=$((matches + 1))
                       ROBOT_NAME="$name"
                       ROBOT_ID=$(field_number "$object" id)
+                      ROBOT_DISABLED=$(field_bool "$object" disable)
+                      ROBOT_EXPIRES_AT=$(field_int "$object" expires_at)
+                      ROBOT_DURATION=$(field_int "$object" duration)
                       ;;
                   esac
                 done < /tmp/robots-obj.txt
@@ -306,10 +361,14 @@ spec:
               # this Job recorded the last time it wrote the Secret. Empty for a
               # Secret written before the annotation existed, or by something
               # else; such a Secret gets one clean rotation so it becomes
-              # verifiable from then on.
+              # verifiable from then on. Also sets SECRET_USERNAME_B64 and
+              # SECRET_REGISTRY_B64 (the non-secret keys, still base64) so a
+              # drifted registry host can be corrected without a rotation.
               read_secret_state() {
                 SECRET_EXISTS=no
                 SECRET_ROBOT_ID=""
+                SECRET_USERNAME_B64=""
+                SECRET_REGISTRY_B64=""
                 status=$(kube -o /tmp/secret-get.json -w '%{http_code}' \
                   "${KUBE_API}/api/v1/namespaces/$1/secrets/$2")
                 case "$status" in
@@ -321,6 +380,18 @@ spec:
                     # line, space after the colon) must still yield the id -
                     # an empty id here would rotate the robot on every run.
                     SECRET_ROBOT_ID=$(sed -n 's|.*"harbor-pack.nebari.dev/robot-id"[[:space:]]*:[[:space:]]*"\([0-9]*\)".*|\1|p' /tmp/secret-get.json)
+                    # Read the two keys out of the "data" object only, so a label
+                    # or annotation that happens to be called "registry" cannot
+                    # stand in for it (managedFields spell it "f:data", and the
+                    # data object holds only strings, so [^}]* is all of it).
+                    # Newlines are dropped first to stay whitespace-tolerant.
+                    secret_data=$(tr -d '\n' < /tmp/secret-get.json \
+                      | sed -n 's|.*"data"[[:space:]]*:[[:space:]]*{\([^}]*\)}.*|\1|p')
+                    SECRET_USERNAME_B64=$(printf '%s' "$secret_data" | tr ',' '\n' \
+                      | sed -n 's|^[[:space:]]*"username"[[:space:]]*:[[:space:]]*"\([^"]*\)".*|\1|p')
+                    SECRET_REGISTRY_B64=$(printf '%s' "$secret_data" | tr ',' '\n' \
+                      | sed -n 's|^[[:space:]]*"registry"[[:space:]]*:[[:space:]]*"\([^"]*\)".*|\1|p')
+                    secret_data=""
                     rm -f /tmp/secret-get.json
                     ;;
                   404)
@@ -378,6 +449,87 @@ spec:
                 esac
               }
 
+              # sync_secret_fields <namespace> <name> <username>
+              # For a Secret that already belongs to the right robot: merge-patch
+              # only the username/registry keys when they differ from what this
+              # run would write (a changed harbor.externalURL, or a changed robot
+              # name prefix). The password is neither read nor rewritten.
+              sync_secret_fields() {
+                b_user=$(printf '%s' "$3" | base64 | tr -d '\n')
+                b_registry=$(printf '%s' "$REGISTRY" | base64 | tr -d '\n')
+                if [ "$SECRET_USERNAME_B64" = "$b_user" ] && [ "$SECRET_REGISTRY_B64" = "$b_registry" ]; then
+                  echo "Secret $1/$2: username and registry are current"
+                  return 0
+                fi
+                printf '{"data":{"username":"%s","registry":"%s"}}' "$b_user" "$b_registry" > /tmp/secret-patch.json
+                status=$(kube -o /tmp/kube-resp.json -w '%{http_code}' \
+                  -X PATCH "${KUBE_API}/api/v1/namespaces/$1/secrets/$2" \
+                  -H "Content-Type: application/merge-patch+json" \
+                  --data-binary @/tmp/secret-patch.json)
+                rm -f /tmp/secret-patch.json
+                if [ "$status" != "200" ]; then
+                  echo "Secret $1/$2: patch failed (HTTP ${status}):" >&2
+                  api_error /tmp/kube-resp.json
+                  rm -f /tmp/kube-resp.json
+                  return 1
+                fi
+                rm -f /tmp/kube-resp.json
+                echo "Secret $1/$2: username/registry updated to ${3} @ ${REGISTRY}"
+              }
+
+              # update_robot <robot_id> <api_name> <level> <duration> <permissions_json> <name>
+              # Re-assert the declared settings with PUT /robots/{id}. Harbor
+              # insists the body's name and level equal the stored robot's, and
+              # the name it compares against is the prefixed API name
+              # ("robot$<project>+<name>") that lookup_robot recorded. The
+              # permission set is replaced wholesale; the secret is untouched.
+              update_robot() {
+                printf '{"name":"%s","description":"%s","level":"%s","duration":%s,"disable":false,"permissions":%s}' \
+                  "$2" "$DESCRIPTION" "$3" "$4" "$5" > /tmp/robot-req.json
+                status=$(curl -s -u "$AUTH" -o /tmp/robot-resp.json -w '%{http_code}' \
+                  -X PUT "${HARBOR_API}/robots/$1" \
+                  -H "Content-Type: application/json" \
+                  --data-binary @/tmp/robot-req.json)
+                rm -f /tmp/robot-req.json
+                if [ "$status" != "200" ]; then
+                  echo "robot $6: update failed (HTTP ${status}):" >&2
+                  api_error /tmp/robot-resp.json
+                  rm -f /tmp/robot-resp.json
+                  return 1
+                fi
+                rm -f /tmp/robot-resp.json
+                echo "robot $6: settings re-asserted (duration $4, enabled, declared permissions)"
+              }
+
+              # robot_expiry <robot_id> <name> - sets ROBOT_EXPIRES_AT from
+              # GET /robots/{id}, for after a PUT that changed the duration.
+              robot_expiry() {
+                status=$(curl -s -u "$AUTH" -o /tmp/robot-get.json -w '%{http_code}' \
+                  "${HARBOR_API}/robots/$1")
+                if [ "$status" != "200" ]; then
+                  echo "robot $2: re-read failed (HTTP ${status}):" >&2
+                  api_error /tmp/robot-get.json
+                  rm -f /tmp/robot-get.json
+                  return 1
+                fi
+                ROBOT_EXPIRES_AT=$(field_int "$(cat /tmp/robot-get.json)" expires_at)
+                rm -f /tmp/robot-get.json
+              }
+
+              # delete_robot <robot_id> <name>
+              delete_robot() {
+                status=$(curl -s -u "$AUTH" -o /tmp/robot-resp.json -w '%{http_code}' \
+                  -X DELETE "${HARBOR_API}/robots/$1")
+                if [ "$status" != "200" ]; then
+                  echo "robot $2: delete failed (HTTP ${status}):" >&2
+                  api_error /tmp/robot-resp.json
+                  rm -f /tmp/robot-resp.json
+                  return 1
+                fi
+                rm -f /tmp/robot-resp.json
+                echo "robot $2: deleted robot $1"
+              }
+
               # create_robot <name> <level> <duration> <permissions_json>
               # Sets ROBOT_ID, ROBOT_NAME (the full username Harbor returns) and
               # ROBOT_PASSWORD (the one-shot secret).
@@ -433,6 +585,26 @@ spec:
                 echo "robot $2: secret rotated"
               }
 
+              # reassert_robot <name> <level> <duration> <permissions_json> <secret_ns> <secret_name>
+              # PUT the declared settings onto the robot lookup_robot found. If
+              # that changed the duration, re-read the expiry: Harbor recomputes
+              # it from the creation time, so a shorter duration can put an old
+              # robot straight past it - in which case recreate it and write
+              # its Secret here. Sets RECREATED=yes when it did.
+              reassert_robot() {
+                RECREATED=""
+                update_robot "$ROBOT_ID" "$ROBOT_NAME" "$2" "$3" "$4" "$1"
+                [ "$ROBOT_DURATION" != "$3" ] || return 0
+                robot_expiry "$ROBOT_ID" "$1"
+                robot_expired "$ROBOT_EXPIRES_AT" || return 0
+                echo "robot $1: robot ${ROBOT_ID} is expired under its new $3-day duration - recreating it"
+                delete_robot "$ROBOT_ID" "$1"
+                create_robot "$1" "$2" "$3" "$4"
+                write_secret "$5" "$6" "$ROBOT_NAME" "$ROBOT_ID"
+                ROBOT_PASSWORD=""
+                RECREATED=yes
+              }
+
               # ensure_robot <name> <stored_name> <level> <project> <duration> <permissions_json> <secret_ns> <secret_name>
               ensure_robot() {
                 rname="$1"
@@ -455,19 +627,41 @@ spec:
                   query="Level=system,name=${stored}"
                 fi
                 if lookup_robot "$stored" "$query"; then
-                  read_secret_state "$sns" "$sname"
-                  if [ "$SECRET_EXISTS" = "yes" ] && [ "$SECRET_ROBOT_ID" = "$ROBOT_ID" ]; then
-                    echo "robot ${rname}: robot ${ROBOT_ID} and Secret ${sns}/${sname} are in sync - nothing to do"
+                  if robot_expired "$ROBOT_EXPIRES_AT"; then
+                    echo "robot ${rname}: robot ${ROBOT_ID} expired - recreating it"
+                    delete_robot "$ROBOT_ID" "$rname"
+                    create_robot "$rname" "$level" "$duration" "$perms"
+                  elif [ "$ROBOT_DISABLED" = "true" ]; then
+                    # Rotate and publish first, re-enable last. Re-enabling
+                    # before the rotation would briefly revive a credential
+                    # someone deliberately cut off; re-enabling before the
+                    # Secret is written would, after a crash, leave an enabled
+                    # robot whose Secret still agrees by id but holds a dead
+                    # password - which the next run would take as in sync.
+                    echo "robot ${rname}: robot ${ROBOT_ID} is disabled in Harbor - rotating its secret, then re-enabling it"
+                    refresh_secret "$ROBOT_ID" "$rname"
+                    write_secret "$sns" "$sname" "$ROBOT_NAME" "$ROBOT_ID"
+                    ROBOT_PASSWORD=""
+                    reassert_robot "$rname" "$level" "$duration" "$perms" "$sns" "$sname"
                     return 0
-                  fi
-                  if [ "$SECRET_EXISTS" = "no" ]; then
-                    echo "robot ${rname}: exists (id ${ROBOT_ID}) but Secret ${sns}/${sname} is missing - rotating"
-                  elif [ -z "$SECRET_ROBOT_ID" ]; then
-                    echo "robot ${rname}: Secret ${sns}/${sname} records no robot id - rotating once so it becomes verifiable"
                   else
-                    echo "robot ${rname}: Secret ${sns}/${sname} records robot ${SECRET_ROBOT_ID}, not ${ROBOT_ID} - rotating"
+                    reassert_robot "$rname" "$level" "$duration" "$perms" "$sns" "$sname"
+                    [ -z "$RECREATED" ] || return 0
+                    read_secret_state "$sns" "$sname"
+                    if [ "$SECRET_EXISTS" = "yes" ] && [ "$SECRET_ROBOT_ID" = "$ROBOT_ID" ]; then
+                      echo "robot ${rname}: robot ${ROBOT_ID} and Secret ${sns}/${sname} are in sync"
+                      sync_secret_fields "$sns" "$sname" "$ROBOT_NAME"
+                      return 0
+                    fi
+                    if [ "$SECRET_EXISTS" = "no" ]; then
+                      echo "robot ${rname}: exists (id ${ROBOT_ID}) but Secret ${sns}/${sname} is missing - rotating"
+                    elif [ -z "$SECRET_ROBOT_ID" ]; then
+                      echo "robot ${rname}: Secret ${sns}/${sname} records no robot id - rotating once so it becomes verifiable"
+                    else
+                      echo "robot ${rname}: Secret ${sns}/${sname} records robot ${SECRET_ROBOT_ID}, not ${ROBOT_ID} - rotating"
+                    fi
+                    refresh_secret "$ROBOT_ID" "$rname"
                   fi
-                  refresh_secret "$ROBOT_ID" "$rname"
                 else
                   create_robot "$rname" "$level" "$duration" "$perms"
                   read_secret_state "$sns" "$sname"
@@ -515,7 +709,7 @@ spec:
               {{- $permNamespace := ternary $project "*" (ne $project "") }}
               {{- $permissions := default (list) $robot.permissions }}
               {{- if not $permissions }}
-              {{- $permissions = list (dict "resource" "repository" "action" "pull") (dict "resource" "artifact" "action" "read") (dict "resource" "artifact" "action" "list") (dict "resource" "tag" "action" "list") }}
+              {{- $permissions = list (dict "resource" "repository" "action" "list") (dict "resource" "repository" "action" "pull") (dict "resource" "artifact" "action" "read") (dict "resource" "artifact" "action" "list") (dict "resource" "tag" "action" "list") }}
               {{- end }}
               {{- $access := list }}
               {{- range $permission := $permissions }}
