@@ -292,7 +292,7 @@ bootstrap:
       level: project             # project | system
       project: cogs              # required for level: project
       duration: -1               # days; -1 = never expires (the default)
-      permissions: []            # [] = pull-only (repository:pull, artifact:read/list, tag:list)
+      permissions: []            # [] = read-only enumeration + pull (repository:list/pull, artifact:read/list, tag:list)
       secret:
         name: harbor-robot-hub-cog-indexer
         namespace: ""            # defaults to the release namespace
@@ -315,12 +315,21 @@ starts returning `401` a month later with nothing in the logs to explain it; `-1
 default.
 
 The `harbor-harbor-pack-bootstrap-robots` Job runs at hook weight `11`, after the projects Job
-(`10`), so a project-level robot's project already exists. It is idempotent, and decides what
-to do by comparing the Secret's `robot-id` annotation against the robot it finds in Harbor:
+(`10`), so a project-level robot's project already exists. It is idempotent, and on every run
+it first reconciles the robot itself with what values declare:
+
+| Robot state in Harbor | Action |
+|---|---|
+| Expired (`expires_at` has passed) | `DELETE` + `POST /robots` — Harbor only recomputes the expiry when the duration changes, so an expired robot cannot be revived in place — then write the Secret |
+| Disabled | `PATCH /robots/{id}` to rotate the secret **before** re-enabling it, so a credential someone cut off stays dead, then rewrite the Secret |
+| Present | `PUT /robots/{id}` re-asserts the declared description, `duration`, `permissions` and `disable: false` (the secret is untouched). If the duration changed, the new expiry is re-read and an already-past one is recreated as above |
+
+Then it decides what to do with the credential by comparing the Secret's `robot-id` annotation
+against the robot it found:
 
 | State found | Action |
 |---|---|
-| Robot exists, Secret exists, ids agree | Nothing — a repeat `helm upgrade` is a no-op |
+| Robot exists, Secret exists, ids agree | Merge-patch the Secret's `username`/`registry` keys if they drifted (e.g. `harbor.externalURL` changed); the password is left alone |
 | Robot exists, Secret exists, ids differ (or no annotation) | `PATCH /robots/{id}` to mint a fresh secret, then rewrite the Secret |
 | Robot exists, Secret missing | `PATCH /robots/{id}`, then write the Secret |
 | Robot missing | `POST /robots`, then write the Secret |
@@ -330,9 +339,9 @@ dies between creating the robot and writing the Secret, the next run sees the mi
 rotates, instead of leaving a dead credential published forever. Legacy Secrets without the
 annotation get exactly one rotation and are verifiable from then on.
 
-An existing Secret is only overwritten when the robot behind it was created or rotated in the
-same run — deleting the Secret and re-running restores it with a freshly rotated credential.
-Two robots may not target the same Secret; `helm template` fails if they do.
+An existing Secret's password is only overwritten when the robot behind it was created or
+rotated in the same run — deleting the Secret and re-running restores it with a freshly rotated
+credential. Two robots may not target the same Secret; `helm template` fails if they do.
 
 The lookup itself is careful, because a false positive would rotate an unrelated robot's secret:
 project robots are listed by project id (`GET /robots` without a level silently means *system*
@@ -347,7 +356,7 @@ robot and Secret payloads carry secret material. Response files are written unde
 and removed by an `EXIT` trap, so a mid-run failure leaves no credential behind in the pod.
 
 Unlike the projects Job, this one needs Kubernetes API access to write Secrets, so it runs as
-its own ServiceAccount with a Role granting `create` on Secrets plus `get`/`update` restricted
+its own ServiceAccount with a Role granting `create` on Secrets plus `get`/`update`/`patch` restricted
 to exactly the Secret names you declared. It talks to the Kubernetes REST API with `curl` and
 the pod's ServiceAccount token, so it shares the same image as the other Jobs — no `kubectl`,
 no extra image.
@@ -588,7 +597,7 @@ Notes per key:
 | `bootstrap.robots[].level` | `project` | `project` or `system`. |
 | `bootstrap.robots[].project` | `""` | Required for `level: project`; for `level: system` it scopes permissions to one project instead of all (`*`). |
 | `bootstrap.robots[].duration` | `-1` | Whole days until expiry; `-1` = never. `0` and fractional values are rejected — do not rely on Harbor's 30-day instance default. |
-| `bootstrap.robots[].permissions` | `[]` | `[]` = pull-only (`repository:pull`, `artifact:read`, `artifact:list`, `tag:list`); otherwise explicit project-scope `{resource, action}` pairs. |
+| `bootstrap.robots[].permissions` | `[]` | `[]` = read-only enumeration + pull (`repository:list`, `repository:pull`, `artifact:read`, `artifact:list`, `tag:list`); otherwise explicit project-scope `{resource, action}` pairs. Re-applied to the existing robot on every run. |
 | `bootstrap.robots[].secret.name` | — | Required; name of the Kubernetes Secret to write. |
 | `bootstrap.robots[].secret.namespace` | `""` | Defaults to the release namespace; another namespace also renders a Role/RoleBinding there. |
 | `harbor.*` | — | Passed to the upstream Harbor chart. |
@@ -660,8 +669,10 @@ Notes per key:
   from values leaves the policy in Harbor (set `enabled: false` to stop delivery, or delete it
   in the UI). Like the other listings, the policy lookup reads one page and fails on
   `X-Total-Count` rather than acting on a truncated list.
-- `bootstrap.robots` is likewise create-only: an existing robot's `duration` or `permissions`
-  are never rewritten, and removing an entry leaves the robot and its Secret in place. Robot
+- `bootstrap.robots` reconciles declared robots (duration, permissions, enabled, expiry) but
+  never deletes undeclared ones: removing an entry leaves the robot and its Secret in place, so
+  to retire a robot remove it from values *and* delete it in Harbor — a declared robot that is
+  disabled by hand is rotated and re-enabled on the next upgrade. Robot
   `permissions` are project-scope resources (permission `kind: project`); system-scope
   permissions are not exposed.
 - Upgrades follow upstream Harbor's chart; review upstream release notes before major bumps.

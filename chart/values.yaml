@@ -254,10 +254,13 @@ bootstrap:
   #     duration: -1              # days; -1 = never expires (default). Never rely on
   #                               # Harbor's instance default (30 days) - a robot
   #                               # created without a duration starts 401-ing silently.
-  #     # Default permission set is pull-only:
-  #     #   repository:pull, artifact:read, artifact:list, tag:list
-  #     # Override with explicit project-scope {resource, action} pairs, e.g. add
-  #     # {resource: repository, action: push} for a CI publisher.
+  #     # Default permission set is read-only enumeration + pull:
+  #     #   repository:list, repository:pull, artifact:read, artifact:list, tag:list
+  #     # (repository:list is what lets a consumer discover a project's
+  #     # repositories rather than being told their names). Override with
+  #     # explicit project-scope {resource, action} pairs, e.g. add
+  #     # {resource: repository, action: push} for a CI publisher. The list
+  #     # is re-applied to the existing robot on every install/upgrade.
   #     permissions: []
   #     secret:
   #       name: harbor-robot-hub-cog-indexer

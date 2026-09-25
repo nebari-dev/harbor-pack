@@ -53,8 +53,8 @@ bootstrap:
   # keys username / password / registry - the only moment Harbor ever reveals a
   # robot secret is its create response, so the Job captures it there.
   robots:
-    # Pull-only indexer for the `cogs` project (the default permission set is
-    # repository:pull, artifact:read, artifact:list, tag:list).
+    # Read-only indexer for the `cogs` project (the default permission set is
+    # repository:list, repository:pull, artifact:read, artifact:list, tag:list).
     - name: hub-cog-indexer
       level: project
       project: cogs
@@ -63,7 +63,7 @@ bootstrap:
       secret:
         name: harbor-robot-hub-cog-indexer
         namespace: ""          # defaults to the release namespace
-    # A publisher for CI, with push added to the pull-only default.
+    # A publisher for CI: an explicit list replaces the default entirely.
     - name: shared-publisher
       level: project
       project: shared

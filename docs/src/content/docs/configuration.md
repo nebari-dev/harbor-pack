@@ -134,8 +134,9 @@ bootstrap:
       level: project             # project | system
       project: cogs              # required for level: project
       duration: -1               # days; -1 = never expires (the default)
-      permissions: []            # [] = pull-only: repository:pull, artifact:read,
-                                 #      artifact:list, tag:list
+      permissions: []            # [] = read-only enumeration + pull: repository:list,
+                                 #      repository:pull, artifact:read, artifact:list,
+                                 #      tag:list
       secret:
         name: harbor-robot-hub-cog-indexer
         namespace: ""            # defaults to the release namespace
@@ -161,12 +162,21 @@ back to that default.
 :::
 
 The Job (`<release>-harbor-pack-bootstrap-robots`) runs at hook weight `11`, after the projects
-Job, so a project-level robot's project already exists. It is idempotent, and decides what to
-do by comparing the Secret's `robot-id` annotation against the robot it finds in Harbor:
+Job, so a project-level robot's project already exists. It is idempotent, and on every run it
+first reconciles the robot itself with what values declare:
+
+| Robot state in Harbor | Action |
+|---|---|
+| Expired (`expires_at` has passed) | `DELETE` + `POST /robots`, then write the Secret. Harbor only recomputes the expiry when the duration changes, so an expired robot cannot be revived in place |
+| Disabled | `PATCH /robots/{id}` to rotate the secret **before** re-enabling it, so a credential someone cut off stays dead, then rewrite the Secret |
+| Present | `PUT /robots/{id}` re-asserts the declared description, `duration`, `permissions` and `disable: false`; the secret is untouched. If the duration changed, the new expiry is re-read and an already-past one is recreated as above |
+
+It then decides what to do with the credential by comparing the Secret's `robot-id` annotation
+against the robot it found:
 
 | State found | Action |
 |---|---|
-| Robot exists, Secret exists, ids agree | Nothing — a repeat `helm upgrade` is a no-op |
+| Robot exists, Secret exists, ids agree | Merge-patch the Secret's `username`/`registry` keys if they drifted (e.g. `harbor.externalURL` changed); the password is left alone |
 | Robot exists, Secret exists, ids differ (or no annotation) | `PATCH /robots/{id}` to mint a fresh secret, then rewrite the Secret |
 | Robot exists, Secret missing | `PATCH /robots/{id}`, then write the Secret |
 | Robot missing | `POST /robots`, then write the Secret |
@@ -176,8 +186,8 @@ dies between creating the robot and writing the Secret, the next run sees the mi
 rotates instead of leaving a dead credential published forever. A Secret written before this
 annotation existed gets exactly one rotation and is verifiable from then on.
 
-An existing Secret is only overwritten when the robot behind it was created or rotated in the
-same run, so deleting the Secret and re-running restores it with a freshly rotated credential.
+An existing Secret's password is only overwritten when the robot behind it was created or
+rotated in the same run, so deleting the Secret and re-running restores it with a freshly rotated credential.
 Two robots may not target the same Secret — `helm template` fails if they do, rather than
 letting them overwrite each other on every run.
 
@@ -195,7 +205,7 @@ robot and Secret payloads carry secret material. Response files are written unde
 and removed by an `EXIT` trap, so a mid-run failure leaves no credential behind in the pod.
 
 Unlike the projects Job, this one must write to the Kubernetes API, so it runs as a dedicated
-ServiceAccount whose Role grants `create` on Secrets plus `get`/`update` restricted to exactly
+ServiceAccount whose Role grants `create` on Secrets plus `get`/`update`/`patch` restricted to exactly
 the Secret names declared in values. It reaches the Kubernetes REST API with `curl` and the
 pod's projected ServiceAccount token, so it reuses the same image as the other Jobs — no
 `kubectl` binary and no extra image to pin.
@@ -212,9 +222,10 @@ The Secrets are written by the Job through the Kubernetes API, not by Helm, so
 `helm uninstall` leaves them behind. Delete them yourself when you remove the release.
 :::
 
-Like the projects Job, this one only adds missing state: an existing robot's `duration` and
-`permissions` are never rewritten, and removing an entry from `robots` leaves the robot and its
-Secret alone. Permissions are project-scope resources (permission `kind: project`); system-scope
+Declared robots are reconciled, but undeclared ones are never deleted: removing an entry from
+`robots` leaves the robot and its Secret alone. To retire a robot, remove it from values *and*
+delete it in Harbor — a declared robot that is disabled by hand is rotated and re-enabled on the
+next upgrade. Permissions are project-scope resources (permission `kind: project`); system-scope
 permissions are not exposed.
 
 To use the credential from a client, see [Registry Setup](/registry-setup/).
@@ -316,7 +327,7 @@ harbor:
 | `bootstrap.robots[].level` | `project` | `project` or `system`. |
 | `bootstrap.robots[].project` | `""` | Required for `level: project`; for `level: system` it scopes permissions to one project instead of all (`*`). |
 | `bootstrap.robots[].duration` | `-1` | Whole days until expiry; `-1` = never. `0` and fractional values are rejected — do not rely on Harbor's 30-day instance default. |
-| `bootstrap.robots[].permissions` | `[]` | `[]` = pull-only; otherwise explicit project-scope `{resource, action}` pairs. |
+| `bootstrap.robots[].permissions` | `[]` | `[]` = read-only enumeration + pull (`repository:list`, `repository:pull`, `artifact:read`, `artifact:list`, `tag:list`); otherwise explicit project-scope `{resource, action}` pairs. Re-applied to the existing robot on every run. |
 | `bootstrap.robots[].secret.name` | — | Required; name of the Kubernetes Secret to write. |
 | `bootstrap.robots[].secret.namespace` | `""` | Defaults to the release namespace; another namespace also renders a Role/RoleBinding there. |
 | `harbor.externalURL` | — | Set to `https://<hostname>`. |
