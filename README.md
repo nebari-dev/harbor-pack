@@ -314,6 +314,12 @@ starts returning `401` a month later with nothing in the logs to explain it; `-1
 `0` and fractional values are rejected at render time rather than silently falling back to that
 default.
 
+Harbor measures `duration` from the robot's **creation**, not from when the value changes: moving
+a robot created 25 days ago from `-1` to `duration: 30` leaves it five days, not thirty. When the
+duration changes the Job logs the resulting expiry date (and recreates the robot if that date
+has already passed); to give an existing robot a full new term, delete it in Harbor and the next
+run recreates it and rewrites its Secret.
+
 The `harbor-harbor-pack-bootstrap-robots` Job runs at hook weight `11`, after the projects Job
 (`10`), so a project-level robot's project already exists. It is idempotent, and on every run
 it first reconciles the robot itself with what values declare:
@@ -596,7 +602,7 @@ Notes per key:
 | `bootstrap.robots[].name` | — | Required; lower-case robot name. Harbor prefixes it (`robot$<project>+<name>`). |
 | `bootstrap.robots[].level` | `project` | `project` or `system`. |
 | `bootstrap.robots[].project` | `""` | Required for `level: project`; for `level: system` it scopes permissions to one project instead of all (`*`). |
-| `bootstrap.robots[].duration` | `-1` | Whole days until expiry; `-1` = never. `0` and fractional values are rejected — do not rely on Harbor's 30-day instance default. |
+| `bootstrap.robots[].duration` | `-1` | Whole days until expiry, counted from the robot's creation; `-1` = never. `0` and fractional values are rejected — do not rely on Harbor's 30-day instance default. |
 | `bootstrap.robots[].permissions` | `[]` | `[]` = read-only enumeration + pull (`repository:list`, `repository:pull`, `artifact:read`, `artifact:list`, `tag:list`); otherwise explicit project-scope `{resource, action}` pairs. Re-applied to the existing robot on every run. |
 | `bootstrap.robots[].secret.name` | — | Required; name of the Kubernetes Secret to write. |
 | `bootstrap.robots[].secret.namespace` | `""` | Defaults to the release namespace; another namespace also renders a Role/RoleBinding there. |

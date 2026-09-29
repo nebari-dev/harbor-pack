@@ -590,13 +590,22 @@ spec:
               # that changed the duration, re-read the expiry: Harbor recomputes
               # it from the creation time, so a shorter duration can put an old
               # robot straight past it - in which case recreate it and write
-              # its Secret here. Sets RECREATED=yes when it did.
+              # its Secret here. Sets RECREATED=yes when it did. Otherwise log
+              # the resulting expiry, since a longer-lived robot can still be
+              # days from it.
               reassert_robot() {
                 RECREATED=""
                 update_robot "$ROBOT_ID" "$ROBOT_NAME" "$2" "$3" "$4" "$1"
                 [ "$ROBOT_DURATION" != "$3" ] || return 0
                 robot_expiry "$ROBOT_ID" "$1"
-                robot_expired "$ROBOT_EXPIRES_AT" || return 0
+                if ! robot_expired "$ROBOT_EXPIRES_AT"; then
+                  case "$ROBOT_EXPIRES_AT" in
+                    -1) echo "robot $1: duration changed from ${ROBOT_DURATION} to $3 days - robot ${ROBOT_ID} now never expires" ;;
+                    "") echo "robot $1: duration changed from ${ROBOT_DURATION} to $3 days - re-read carried no expires_at" >&2 ;;
+                    *) echo "robot $1: duration changed from ${ROBOT_DURATION} to $3 days, counted from the robot's creation - robot ${ROBOT_ID} now expires $(date -u -d "@${ROBOT_EXPIRES_AT}" +%Y-%m-%dT%H:%M:%SZ) (in $(( (ROBOT_EXPIRES_AT - $(date +%s)) / 86400 )) days)" ;;
+                  esac
+                  return 0
+                fi
                 echo "robot $1: robot ${ROBOT_ID} is expired under its new $3-day duration - recreating it"
                 delete_robot "$ROBOT_ID" "$1"
                 create_robot "$1" "$2" "$3" "$4"

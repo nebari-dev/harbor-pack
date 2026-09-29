@@ -254,6 +254,10 @@ bootstrap:
   #     duration: -1              # days; -1 = never expires (default). Never rely on
   #                               # Harbor's instance default (30 days) - a robot
   #                               # created without a duration starts 401-ing silently.
+  #                               # Harbor counts it from the robot's CREATION: changing
+  #                               # a 25-day-old robot to 30 leaves it 5 days (the Job
+  #                               # logs the new expiry). Delete the robot in Harbor to
+  #                               # have the next run recreate it with a full term.
   #     # Default permission set is read-only enumeration + pull:
   #     #   repository:list, repository:pull, artifact:read, artifact:list, tag:list
   #     # (repository:list is what lets a consumer discover a project's

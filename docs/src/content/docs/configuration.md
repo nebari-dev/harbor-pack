@@ -159,6 +159,12 @@ Harbor's instance default `robot_token_duration` is 30 days. A robot created wit
 explicit duration expires silently and the consumer starts getting `401`s a month later. `-1`
 means never; `0` and fractional values are rejected at render time so they cannot quietly fall
 back to that default.
+
+Harbor measures `duration` from the robot's **creation**, not from when the value changes: moving
+a robot created 25 days ago from `-1` to `duration: 30` leaves it five days, not thirty. When the
+duration changes the Job logs the resulting expiry date (and recreates the robot if that date
+has already passed); to give an existing robot a full new term, delete it in Harbor and the next
+run recreates it and rewrites its Secret.
 :::
 
 The Job (`<release>-harbor-pack-bootstrap-robots`) runs at hook weight `11`, after the projects
@@ -326,7 +332,7 @@ harbor:
 | `bootstrap.robots[].name` | — | Required; lower-case robot name. Harbor prefixes it (`robot$<project>+<name>`). |
 | `bootstrap.robots[].level` | `project` | `project` or `system`. |
 | `bootstrap.robots[].project` | `""` | Required for `level: project`; for `level: system` it scopes permissions to one project instead of all (`*`). |
-| `bootstrap.robots[].duration` | `-1` | Whole days until expiry; `-1` = never. `0` and fractional values are rejected — do not rely on Harbor's 30-day instance default. |
+| `bootstrap.robots[].duration` | `-1` | Whole days until expiry, counted from the robot's creation; `-1` = never. `0` and fractional values are rejected — do not rely on Harbor's 30-day instance default. |
 | `bootstrap.robots[].permissions` | `[]` | `[]` = read-only enumeration + pull (`repository:list`, `repository:pull`, `artifact:read`, `artifact:list`, `tag:list`); otherwise explicit project-scope `{resource, action}` pairs. Re-applied to the existing robot on every run. |
 | `bootstrap.robots[].secret.name` | — | Required; name of the Kubernetes Secret to write. |
 | `bootstrap.robots[].secret.namespace` | `""` | Defaults to the release namespace; another namespace also renders a Role/RoleBinding there. |
