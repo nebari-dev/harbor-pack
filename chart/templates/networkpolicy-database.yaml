@@ -8,7 +8,8 @@
 {{- if not $db.allowedComponents }}
 {{- fail "networkPolicy.database.allowedComponents is empty: that would cut Harbor core off from its database." }}
 {{- end }}
-{{- $app := .Values.harbor.nameOverride | default "harbor" }}
+{{- /* Same normalization as upstream harbor.name, so the selector matches its app label. */}}
+{{- $app := .Values.harbor.nameOverride | default "harbor" | trunc 63 | trimSuffix "-" }}
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:

@@ -399,8 +399,9 @@ networkPolicy:
     enabled: true
 ```
 
-This renders a NetworkPolicy that admits only Harbor `core`, `exporter` and
-`jobservice` (`networkPolicy.database.allowedComponents`) to the database pod on
+This renders a NetworkPolicy that admits only Harbor `core`, `exporter`,
+`jobservice` and the pre-upgrade `migrator` hook
+(`networkPolicy.database.allowedComponents`) to the database pod on
 5432 and denies all other ingress. It is not rendered for an external database.
 **It only takes effect where the CNI enforces NetworkPolicy.** On EKS with the
 VPC CNI that is off by default and needs the add-on configuration
@@ -628,7 +629,7 @@ Notes per key:
 | `bootstrap.robots[].secret.name` | — | Required; name of the Kubernetes Secret to write. |
 | `bootstrap.robots[].secret.namespace` | `""` | Defaults to the release namespace; another namespace also renders a Role/RoleBinding there. |
 | `networkPolicy.database.enabled` | `false` | Restrict ingress to the in-chart PostgreSQL (see [Isolating the in-chart database](#isolating-the-in-chart-database)). Needs a CNI that enforces NetworkPolicy. |
-| `networkPolicy.database.allowedComponents` | `[core, exporter, jobservice]` | Upstream `component` label values admitted on 5432. Must not be empty. |
+| `networkPolicy.database.allowedComponents` | `[core, exporter, jobservice, migrator]` | Upstream `component` label values admitted on 5432. Must not be empty. |
 | `harbor.*` | — | Passed to the upstream Harbor chart. |
 
 ## Troubleshooting

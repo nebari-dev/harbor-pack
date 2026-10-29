@@ -127,7 +127,13 @@ jobs:
             > /tmp/netpol.yaml
           kubeconform -strict -ignore-missing-schemas -summary /tmp/netpol.yaml
           test "$(grep -c '^kind: NetworkPolicy' /tmp/netpol.yaml)" -eq 1
-          grep -q 'component: database' /tmp/netpol.yaml
+          helm template harbor chart/ \
+            --set nebariapp.enabled=false \
+            --set harbor.harborAdminPassword=ci \
+            --set networkPolicy.database.enabled=true \
+            --show-only templates/networkpolicy-database.yaml > /tmp/netpol-only.yaml
+          grep -q 'component: database' /tmp/netpol-only.yaml
+          grep -q -- '- migrator' /tmp/netpol-only.yaml
           # Default and external-database renders carry no policy.
           for extra in "" "--set networkPolicy.database.enabled=true --set harbor.database.type=external"; do
             # shellcheck disable=SC2086

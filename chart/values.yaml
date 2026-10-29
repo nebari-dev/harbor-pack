@@ -290,11 +290,13 @@ networkPolicy:
   database:
     enabled: false
     # Values of the upstream `component` label. core and exporter read the
-    # database; jobservice is included as a margin.
+    # database; migrator is the pre-upgrade migration hook
+    # (harbor.enableMigrateHelmHook); jobservice is included as a margin.
     allowedComponents:
       - core
       - exporter
       - jobservice
+      - migrator
 
 # =============================================================================
 # Harbor (upstream subchart) overrides
