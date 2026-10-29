@@ -273,6 +273,29 @@ bootstrap:
   #                               # the namespace must already exist; many consuming
   #                               # charts would rather reflect/copy the Secret instead.
 
+# -----------------------------------------------------------------------------
+# Network policy for Harbor's internal PostgreSQL
+# -----------------------------------------------------------------------------
+# The upstream chart's internal database runs with a published default
+# superuser password and no existing-Secret option, so the only control over who
+# can use it is who can reach it. When enabled, this admits connections to the
+# database pod on 5432 only from the Harbor components listed below and denies
+# all other ingress. Rendered only for `harbor.database.type: internal` (the
+# default); an external database is outside this chart.
+#
+# A NetworkPolicy does nothing unless the cluster's CNI enforces it. On EKS
+# with the VPC CNI that means the add-on's `enableNetworkPolicy: "true"`;
+# check before relying on this.
+networkPolicy:
+  database:
+    enabled: false
+    # Values of the upstream `component` label. core and exporter read the
+    # database; jobservice is included as a margin.
+    allowedComponents:
+      - core
+      - exporter
+      - jobservice
+
 # =============================================================================
 # Harbor (upstream subchart) overrides
 # =============================================================================
