@@ -387,6 +387,28 @@ and [`examples/nebari-values.yaml`](examples/nebari-values.yaml):
 - Database → `harbor.database.type: external` + `harbor.database.external.*`
 - Redis → `harbor.redis.type: external` + `harbor.redis.external.*`
 
+### Isolating the in-chart database
+
+The upstream internal PostgreSQL runs with the chart's published default
+superuser password, and upstream offers no existing-Secret option for it. If you
+keep the in-chart database, limit who can reach it:
+
+```yaml
+networkPolicy:
+  database:
+    enabled: true
+```
+
+This renders a NetworkPolicy that admits only Harbor `core`, `exporter`,
+`jobservice` and the pre-upgrade `migrator` hook
+(`networkPolicy.database.allowedComponents`) to the database pod on
+5432 and denies all other ingress. It is not rendered for an external database.
+**It only takes effect where the CNI enforces NetworkPolicy.** On EKS with the
+VPC CNI that is off by default and needs the add-on configuration
+`{"enableNetworkPolicy": "true"}`. Check before relying on it, for example by
+connecting to `harbor-database:5432` from a pod outside Harbor, which should
+time out.
+
 ## Stable secrets (GitOps)
 
 The upstream Harbor chart mints credentials **at render time** when they are not supplied
@@ -606,6 +628,8 @@ Notes per key:
 | `bootstrap.robots[].permissions` | `[]` | `[]` = read-only enumeration + pull (`repository:list`, `repository:pull`, `artifact:read`, `artifact:list`, `tag:list`); otherwise explicit project-scope `{resource, action}` pairs. Re-applied to the existing robot on every run. |
 | `bootstrap.robots[].secret.name` | — | Required; name of the Kubernetes Secret to write. |
 | `bootstrap.robots[].secret.namespace` | `""` | Defaults to the release namespace; another namespace also renders a Role/RoleBinding there. |
+| `networkPolicy.database.enabled` | `false` | Restrict ingress to the in-chart PostgreSQL (see [Isolating the in-chart database](#isolating-the-in-chart-database)). Needs a CNI that enforces NetworkPolicy. |
+| `networkPolicy.database.allowedComponents` | `[core, exporter, jobservice, migrator]` | Upstream `component` label values admitted on 5432. Must not be empty. |
 | `harbor.*` | — | Passed to the upstream Harbor chart. |
 
 ## Troubleshooting

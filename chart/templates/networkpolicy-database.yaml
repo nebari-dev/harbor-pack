@@ -1,0 +1,42 @@
+{{/*
+  Restrict ingress to Harbor's internal PostgreSQL to the Harbor components that
+  use it. See networkPolicy.database in values.yaml; enforcement depends on the
+  cluster's CNI.
+*/}}
+{{- $db := .Values.networkPolicy.database -}}
+{{- if and $db.enabled (eq (.Values.harbor.database.type | default "internal") "internal") }}
+{{- if not $db.allowedComponents }}
+{{- fail "networkPolicy.database.allowedComponents is empty: that would cut Harbor core off from its database." }}
+{{- end }}
+{{- /* Same normalization as upstream harbor.name, so the selector matches its app label. */}}
+{{- $app := .Values.harbor.nameOverride | default "harbor" | trunc 63 | trimSuffix "-" }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "harbor-pack.fullname" . }}-database
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "harbor-pack.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app: {{ $app | quote }}
+      component: database
+      release: {{ .Release.Name | quote }}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: {{ $app | quote }}
+              release: {{ .Release.Name | quote }}
+            matchExpressions:
+              - key: component
+                operator: In
+                values:
+                  {{- toYaml $db.allowedComponents | nindent 18 }}
+      ports:
+        - protocol: TCP
+          port: 5432
+{{- end }}
